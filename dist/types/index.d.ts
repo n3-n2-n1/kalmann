@@ -149,4 +149,49 @@ export interface LogEntry {
     module: string;
     data?: any;
 }
+export interface PositionTracking {
+    symbol: string;
+    side: 'Buy' | 'Sell';
+    entryPrice: number;
+    entryTime: number;
+    maxPriceReached: number;
+    minPriceReached: number;
+    trailingStopActive: boolean;
+    currentStopLoss: number;
+    currentTakeProfit: number;
+    lastUpdateTime: number;
+    profitLadderExecuted: number[];
+}
+export interface ExitStrategy {
+    name: string;
+    triggered: boolean;
+    score: number;
+    reason: string;
+    action: 'CLOSE_100' | 'CLOSE_50' | 'CLOSE_25' | 'UPDATE_SL' | 'HOLD';
+}
+export interface PositionAnalysis {
+    position: Position;
+    timeInPosition: number;
+    unrealizedPnL: number;
+    unrealizedPnLPercentage: number;
+    analysis: {
+        ai: AIAnalysis;
+        technical: TechnicalIndicators;
+        kalman: KalmanPrediction;
+    };
+    trailingStop: {
+        active: boolean;
+        maxPriceReached: number;
+        currentSL: number;
+        shouldUpdate: boolean;
+        newSL?: number;
+    };
+    exitStrategies: ExitStrategy[];
+    recommendation: {
+        action: 'HOLD' | 'CLOSE_FULL' | 'CLOSE_PARTIAL' | 'UPDATE_TRAILING';
+        percentage?: number;
+        reasons: string[];
+        confidence: number;
+    };
+}
 //# sourceMappingURL=index.d.ts.map

@@ -10,7 +10,9 @@ export declare class TradingStrategy {
     private riskManager;
     private bybit;
     private dataManager;
+    private redisHistory;
     private isRunning;
+    private positionTracking;
     constructor();
     /**
      * Inicia la estrategia de trading
@@ -33,19 +35,27 @@ export declare class TradingStrategy {
      */
     private generateTradingSignal;
     /**
-     * Analiza posición existente y decide si cerrar
-     */
-    private analyzeExistingPosition;
-    /**
-     * Determina si debe cerrar una posición existente
-     */
-    private shouldClosePosition;
-    /**
      * Ejecuta una acción de trading
      */
     private executeTradingAction;
     /**
-     * Calcula el leverage óptimo - OPTIMIZADO PARA APALANCAMIENTO ALTO
+     * Gestiona posiciones existentes: trailing stop y estrategias de salida
+     */
+    private manageExistingPositions;
+    /**
+     * Actualiza el trailing stop de una posición
+     */
+    private updateTrailingStop;
+    /**
+     * Evalúa todas las estrategias de salida y retorna recomendación
+     */
+    private evaluateExitStrategies;
+    /**
+     * Ejecuta la acción de salida recomendada
+     */
+    private executeExitAction;
+    /**
+     * Calcula el leverage óptimo - AJUSTADO PARA SCALPING (MÁS CONSERVADOR)
      */
     private calculateOptimalLeverage;
     /**
@@ -53,11 +63,11 @@ export declare class TradingStrategy {
      */
     private calculatePositionSize;
     /**
-     * Calcula el stop loss
+     * Calcula el stop loss - AJUSTADO PARA SCALPING
      */
     private calculateStopLoss;
     /**
-     * Calcula el take profit
+     * Calcula el take profit - AJUSTADO PARA SCALPING
      */
     private calculateTakeProfit;
     /**

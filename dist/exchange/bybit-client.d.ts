@@ -17,6 +17,20 @@ export declare class BybitClient {
      */
     getKlines(symbol: string, interval: string, limit?: number): Promise<Kline[]>;
     /**
+     * Obtiene el Order Book (libro de órdenes) para análisis de liquidez y presión compra/venta
+     */
+    getOrderBook(symbol: string, depth?: number): Promise<{
+        bids: Array<{
+            price: number;
+            quantity: number;
+        }>;
+        asks: Array<{
+            price: number;
+            quantity: number;
+        }>;
+        timestamp: number;
+    }>;
+    /**
      * Ejecuta una orden de trading
      */
     executeTrade(params: {
@@ -44,9 +58,25 @@ export declare class BybitClient {
         usedMargin: number;
     }>;
     /**
-     * Cierra una posición específica
+     * Actualiza el Stop Loss de una posición existente (para trailing stop)
      */
-    closePosition(symbol: string, side: 'Buy' | 'Sell'): Promise<TradeResult>;
+    updatePositionStopLoss(symbol: string, stopLoss: number, takeProfit?: number): Promise<void>;
+    /**
+     * Obtiene el historial de órdenes ejecutadas
+     */
+    getOrderHistory(symbol: string, limit?: number): Promise<any[]>;
+    /**
+     * Verifica si hubo ejecuciones de TP/SL en las últimas órdenes
+     */
+    checkTPSLExecutions(symbol: string, lastCheckTime: number): Promise<{
+        tpExecuted: boolean;
+        slExecuted: boolean;
+        orders: any[];
+    }>;
+    /**
+     * Cierra una posición específica (completa o parcial)
+     */
+    closePosition(symbol: string, side: 'Buy' | 'Sell', percentage?: number): Promise<TradeResult>;
     /**
      * Realiza una petición autenticada a la API
      */
@@ -75,5 +105,10 @@ export declare class BybitClient {
      * Convierte intervalo a formato de Bybit
      */
     private convertInterval;
+    /**
+     * Limpia errores de precisión de punto flotante
+     * Convierte 0.40700000000000003 -> "0.407"
+     */
+    private cleanFloatPrecision;
 }
 //# sourceMappingURL=bybit-client.d.ts.map

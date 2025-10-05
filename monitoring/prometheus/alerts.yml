@@ -1,0 +1,113 @@
+groups:
+  - name: trading_bot_alerts
+    interval: 30s
+    rules:
+      # Alerta si el bot está caído
+      - alert: TradingBotDown
+        expr: up{job="trading-bot"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: trading-bot
+        annotations:
+          summary: "Trading Bot está caído"
+          description: "El bot de trading no responde en {{ $labels.instance }}"
+
+      # Alerta si hay pérdidas significativas
+      - alert: SignificantLoss
+        expr: trading_bot_pnl_total < -1000
+        for: 5m
+        labels:
+          severity: warning
+          component: trading
+        annotations:
+          summary: "Pérdida significativa detectada"
+          description: "PnL total es {{ $value }} USDT - revisar estrategia"
+
+      # Alerta si el uso de CPU es muy alto
+      - alert: HighCPUUsage
+        expr: rate(process_cpu_seconds_total{job="trading-bot"}[5m]) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          component: system
+        annotations:
+          summary: "Uso alto de CPU en Trading Bot"
+          description: "CPU usage es {{ humanize $value }}%"
+
+      # Alerta si el uso de memoria es muy alto
+      - alert: HighMemoryUsage
+        expr: process_resident_memory_bytes{job="trading-bot"} / 1024 / 1024 > 1024
+        for: 5m
+        labels:
+          severity: warning
+          component: system
+        annotations:
+          summary: "Uso alto de memoria en Trading Bot"
+          description: "Memoria usada: {{ humanize $value }} MB"
+
+      # Alerta si hay muchos errores
+      - alert: HighErrorRate
+        expr: rate(trading_bot_errors_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          component: trading
+        annotations:
+          summary: "Tasa alta de errores"
+          description: "{{ $value }} errores por segundo en los últimos 5 minutos"
+
+      # Alerta si no hay trades en mucho tiempo
+      - alert: NoTradingActivity
+        expr: (time() - trading_bot_last_trade_timestamp) > 3600
+        for: 10m
+        labels:
+          severity: info
+          component: trading
+        annotations:
+          summary: "Sin actividad de trading"
+          description: "No se han ejecutado trades en la última hora"
+
+      # Alerta si el balance disponible es muy bajo
+      - alert: LowBalance
+        expr: trading_bot_balance_available < 100
+        for: 5m
+        labels:
+          severity: warning
+          component: trading
+        annotations:
+          summary: "Balance disponible bajo"
+          description: "Balance disponible: {{ $value }} USDT - considerar depositar fondos"
+
+      # Alerta si hay posiciones abiertas con pérdidas significativas
+      - alert: PositionInLoss
+        expr: trading_bot_position_pnl_percent < -5
+        for: 10m
+        labels:
+          severity: warning
+          component: trading
+        annotations:
+          summary: "Posición con pérdida significativa"
+          description: "Posición con {{ $value }}% de pérdida - revisar estrategia de salida"
+
+      # Alerta si Ollama no responde
+      - alert: OllamaUnreachable
+        expr: trading_bot_ollama_health == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: ai
+        annotations:
+          summary: "Ollama AI no responde"
+          description: "El servicio de IA Ollama no está disponible"
+
+      # Alerta si Bybit API no responde
+      - alert: BybitAPIUnreachable
+        expr: trading_bot_bybit_health == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: exchange
+        annotations:
+          summary: "Bybit API no responde"
+          description: "La API de Bybit no está disponible"

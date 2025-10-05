@@ -1,0 +1,51 @@
+global:
+  scrape_interval: 15s # Recolectar métricas cada 15 segundos
+  evaluation_interval: 15s # Evaluar reglas cada 15 segundos
+  external_labels:
+    cluster: 'kalmann-trading-bot'
+    environment: 'production'
+
+# Configuración de Alertmanager
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+# Reglas de alertas
+rule_files:
+  - "alerts.yml"
+
+# Configuración de scrape (recolección de métricas)
+scrape_configs:
+  # Métricas del Trading Bot
+  - job_name: 'trading-bot'
+    static_configs:
+      - targets: ['host.docker.internal:9090']
+        labels:
+          service: 'trading-bot'
+          type: 'application'
+
+  # Métricas de Prometheus mismo
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+        labels:
+          service: 'prometheus'
+          type: 'monitoring'
+
+  # Métricas del sistema (Node Exporter)
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+        labels:
+          service: 'node-exporter'
+          type: 'system'
+
+  # Métricas de Grafana
+  - job_name: 'grafana'
+    static_configs:
+      - targets: ['grafana:3000']
+        labels:
+          service: 'grafana'
+          type: 'monitoring'

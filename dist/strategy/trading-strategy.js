@@ -8,6 +8,8 @@ const kalman_filter_1 = require("../analysis/kalman-filter");
 const risk_manager_1 = require("../risk/risk-manager");
 const bybit_client_1 = require("../exchange/bybit-client");
 const data_manager_1 = require("../data/data-manager");
+const metrics_1 = require("../utils/metrics");
+const redis_history_1 = require("../data/redis-history");
 /**
  * Estrategia de trading automatizada con IA
  * Combina análisis técnico, predicción Kalman y decisiones de IA
@@ -20,8 +22,9 @@ class TradingStrategy {
     riskManager;
     bybit;
     dataManager;
+    redisHistory;
     isRunning = false;
-    // private currentPositions: Map<string, any> = new Map(); // Para futuras implementaciones
+    positionTracking = new Map(); // Track posiciones para trailing stop
     constructor() {
         this.logger = new logger_1.Logger('TradingStrategy');
         this.ollama = new ollama_client_1.OllamaClient();
@@ -30,6 +33,7 @@ class TradingStrategy {
         this.riskManager = new risk_manager_1.RiskManager();
         this.bybit = new bybit_client_1.BybitClient();
         this.dataManager = new data_manager_1.DataManager();
+        this.redisHistory = new redis_history_1.RedisHistoryManager(process.env.TRADING_SYMBOL || 'BTCUSDT');
     }
     /**
      * Inicia la estrategia de trading
@@ -76,7 +80,9 @@ class TradingStrategy {
                 const klines = this.dataManager.getKlines(symbol, 100);
                 // Realizar análisis completo
                 const analysis = await this.performCompleteAnalysis(symbol, klines);
-                // Generar señal de trading
+                // Primero: gestionar posiciones existentes (trailing stop, estrategias de salida)
+                await this.manageExistingPositions(symbol, analysis);
+                // Luego: generar nuevas señales de trading si no hay posiciones
                 const signal = await this.generateTradingSignal(symbol, analysis);
                 // Ejecutar acción si es necesaria
                 if (signal) {
@@ -99,14 +105,17 @@ class TradingStrategy {
      * Realiza análisis completo del mercado
      */
     async performCompleteAnalysis(symbol, klines) {
+        const startTime = Date.now();
         // Análisis técnico
         const technical = await this.technical.analyze(klines);
         // Predicción Kalman
         const kalman = await this.kalman.predict(klines);
         // Datos de mercado
         const marketData = await this.bybit.getMarketData(symbol);
-        // Análisis de IA
-        const aiPrompt = this.buildAIPrompt(marketData, technical, kalman, klines);
+        // Obtener contexto histórico de Redis
+        const historicalContext = await this.redisHistory.getContextForAI();
+        // Análisis de IA con contexto histórico
+        const aiPrompt = this.buildAIPrompt(marketData, technical, kalman, klines, historicalContext);
         const ai = await this.ollama.analyze(aiPrompt);
         this.logger.aiAnalysis({
             symbol,
@@ -115,6 +124,29 @@ class TradingStrategy {
             reasoning: ai.reasoning,
             indicators: technical
         });
+        // Actualizar métricas
+        try {
+            const metrics = (0, metrics_1.getMetrics)();
+            // Métricas de IA y Kalman
+            metrics.updateAIMetrics({
+                confidence: ai.confidence,
+                decision: ai.decision,
+                kalmanConfidence: kalman.confidence
+            });
+            // Métricas de indicadores técnicos
+            metrics.updateTechnicalIndicators({
+                rsi: technical.rsi,
+                macdHistogram: technical.macd.histogram,
+                macdLine: technical.macd.macd,
+                macdSignal: technical.macd.signal
+            });
+            // Duración del análisis
+            const duration = (Date.now() - startTime) / 1000;
+            metrics.recordAnalysisDuration(duration);
+        }
+        catch (error) {
+            // Ignorar error si métricas no están inicializadas
+        }
         return { technical, kalman, ai, marketData };
     }
     /**
@@ -123,11 +155,30 @@ class TradingStrategy {
     async generateTradingSignal(symbol, analysis) {
         const { technical, kalman, ai, marketData } = analysis;
         // Verificar si ya tenemos una posición abierta
-        const existingPosition = await this.bybit.getPositions(symbol);
-        this.logger.info(`Posiciones existentes: ${existingPosition.length}`);
-        if (existingPosition.length > 0) {
-            this.logger.info('Analizando posición existente...');
-            return this.analyzeExistingPosition(existingPosition[0], analysis);
+        const existingPositions = await this.bybit.getPositions(symbol);
+        if (existingPositions.length > 0) {
+            const position = existingPositions[0];
+            const positionSide = position.side; // 'Buy' o 'Sell'
+            // LÓGICA CRÍTICA: No permitir abrir posición contraria ni duplicar
+            if (positionSide === 'Buy' && ai.decision === 'BUY') {
+                this.logger.info('⚠️  Ya tenemos posición LONG abierta, IA sugiere BUY pero no abriremos otra. Esperando gestión de posición existente.');
+                return null;
+            }
+            if (positionSide === 'Sell' && ai.decision === 'SELL') {
+                this.logger.info('⚠️  Ya tenemos posición SHORT abierta, IA sugiere SELL pero no abriremos otra. Esperando gestión de posición existente.');
+                return null;
+            }
+            if (positionSide === 'Buy' && ai.decision === 'SELL') {
+                this.logger.info('🔴 Tenemos LONG abierto pero IA sugiere SHORT. NO abriremos SHORT (sería hedging). La IA debería cerrar el LONG primero en manageExistingPositions.');
+                return null;
+            }
+            if (positionSide === 'Sell' && ai.decision === 'BUY') {
+                this.logger.info('🔴 Tenemos SHORT abierto pero IA sugiere LONG. NO abriremos LONG (sería hedging). La IA debería cerrar el SHORT primero en manageExistingPositions.');
+                return null;
+            }
+            // Si llegamos aquí, hay una posición pero no entra en ninguna categoría (no debería pasar)
+            this.logger.info('Ya existe una posición abierta, no se abrirá nueva posición');
+            return null;
         }
         // Generar nueva señal solo si no hay posición
         if (ai.decision === 'HOLD') {
@@ -159,48 +210,10 @@ class TradingStrategy {
         };
     }
     /**
-     * Analiza posición existente y decide si cerrar
-     */
-    async analyzeExistingPosition(position, analysis) {
-        const { ai, technical, kalman } = analysis;
-        // Lógica para cerrar posición
-        const shouldClose = this.shouldClosePosition(position, ai, technical, kalman);
-        if (shouldClose) {
-            return {
-                symbol: position.symbol,
-                action: 'CLOSE',
-                leverage: position.leverage,
-                quantity: position.size,
-                timestamp: Date.now(),
-                aiAnalysis: ai
-            };
-        }
-        return null;
-    }
-    /**
-     * Determina si debe cerrar una posición existente
-     */
-    shouldClosePosition(position, ai, _technical, _kalman) {
-        // Cerrar si la IA sugiere lo contrario a la posición actual
-        if (position.side === 'Buy' && ai.decision === 'SELL')
-            return true;
-        if (position.side === 'Sell' && ai.decision === 'BUY')
-            return true;
-        // Cerrar si hay pérdida significativa
-        if (position.pnlPercentage < -5)
-            return true;
-        // Cerrar si hay ganancia significativa y la IA sugiere HOLD
-        if (position.pnlPercentage > 8 && ai.decision === 'HOLD')
-            return true;
-        // Cerrar si la confianza de la IA es muy baja
-        if (ai.confidence < 0.3)
-            return true;
-        return false;
-    }
-    /**
      * Ejecuta una acción de trading
      */
     async executeTradingAction(signal) {
+        const startTime = Date.now();
         try {
             this.logger.info('=== INICIO EJECUCIÓN DE TRADE ===');
             this.logger.info(`Señal: ${JSON.stringify(signal)}`);
@@ -216,16 +229,38 @@ class TradingStrategy {
             });
             this.logger.info(`Resultado validación: ${JSON.stringify(riskValidation)}`);
             if (!riskValidation.approved) {
-                this.logger.warn(`Trade rechazado por gestión de riesgo: ${riskValidation.reason}`);
-                return;
+                // Si hay parámetros ajustados sugeridos, intentar usar esos
+                if (riskValidation.adjustedParams && riskValidation.adjustedParams.quantity > 0) {
+                    this.logger.info(`Trade ajustado por Risk Manager. Cantidad ajustada: ${riskValidation.adjustedParams.quantity}`);
+                    // Actualizar la señal con los parámetros ajustados
+                    signal.quantity = riskValidation.adjustedParams.quantity;
+                    signal.leverage = riskValidation.adjustedParams.leverage;
+                    signal.stopLoss = riskValidation.adjustedParams.stopLoss;
+                    signal.takeProfit = riskValidation.adjustedParams.takeProfit;
+                    this.logger.info(`Ejecutando trade con parámetros ajustados: ${signal.quantity} ${signal.symbol}`);
+                }
+                else {
+                    this.logger.warn(`Trade rechazado por gestión de riesgo: ${riskValidation.reason}`);
+                    return;
+                }
             }
-            this.logger.info('Trade aprobado por Risk Manager, ejecutando...');
+            else {
+                this.logger.info('Trade aprobado por Risk Manager, ejecutando...');
+            }
             if (signal.action === 'CLOSE') {
                 await this.bybit.closePosition(signal.symbol, signal.quantity > 0 ? 'Buy' : 'Sell');
                 this.logger.trade('CLOSE', {
                     symbol: signal.symbol,
                     quantity: signal.quantity
                 });
+                // Actualizar métricas
+                try {
+                    const metrics = (0, metrics_1.getMetrics)();
+                    metrics.recordTrade(signal.quantity > 0 ? 'buy' : 'sell', true);
+                }
+                catch (error) {
+                    // Ignorar
+                }
             }
             else {
                 const result = await this.bybit.executeTrade({
@@ -243,46 +278,469 @@ class TradingStrategy {
                     price: result.price,
                     pnl: 0
                 });
+                // Registrar apertura en Redis
+                const tradeId = await this.redisHistory.recordTradeOpen({
+                    action: signal.action,
+                    confidence: signal.aiAnalysis.confidence,
+                    price: result.price,
+                    rsi: signal.aiAnalysis.indicators?.rsi || 0,
+                    macdHistogram: signal.aiAnalysis.indicators?.macd?.histogram || 0,
+                    kalmanTrend: signal.aiAnalysis.marketSentiment || 'neutral',
+                    leverage: signal.leverage,
+                    quantity: signal.quantity
+                });
+                // Guardar tradeId en tracking
+                const trackingKey = `${signal.symbol}_${signal.action === 'BUY' ? 'Buy' : 'Sell'}`;
+                if (!this.positionTracking.has(trackingKey)) {
+                    this.positionTracking.set(trackingKey, {
+                        symbol: signal.symbol,
+                        side: signal.action === 'BUY' ? 'Buy' : 'Sell',
+                        entryPrice: result.price,
+                        entryTime: Date.now(),
+                        maxPriceReached: result.price,
+                        minPriceReached: result.price,
+                        trailingStopActive: false,
+                        profitLadderExecuted: [],
+                        lastOrderCheckTime: Date.now(),
+                        tradeId: tradeId // Guardar ID para cerrar después
+                    });
+                }
                 // Incrementar contador de trades
                 this.riskManager.incrementTradeCounter();
+                // Actualizar métricas
+                try {
+                    const metrics = (0, metrics_1.getMetrics)();
+                    metrics.recordTrade(signal.action === 'BUY' ? 'buy' : 'sell', true);
+                    // Obtener balance actualizado
+                    const balance = await this.bybit.getBalance();
+                    metrics.updateTradingMetrics({
+                        balanceAvailable: balance.availableBalance,
+                        balanceTotal: balance.totalBalance,
+                        positionSize: signal.quantity,
+                        positionLeverage: signal.leverage
+                    });
+                    // Duración de ejecución
+                    const duration = (Date.now() - startTime) / 1000;
+                    metrics.recordTradeExecutionDuration(duration);
+                }
+                catch (error) {
+                    // Ignorar error si métricas no están inicializadas
+                }
             }
         }
         catch (error) {
             this.logger.error('Error ejecutando acción de trading:', error);
+            // Registrar error en métricas
+            try {
+                const metrics = (0, metrics_1.getMetrics)();
+                metrics.recordError('trade_execution');
+            }
+            catch (e) {
+                // Ignorar
+            }
         }
     }
     /**
-     * Calcula el leverage óptimo - OPTIMIZADO PARA APALANCAMIENTO ALTO
+     * Gestiona posiciones existentes: trailing stop y estrategias de salida
+     */
+    async manageExistingPositions(symbol, analysis) {
+        try {
+            const positions = await this.bybit.getPositions(symbol);
+            // Actualizar métricas de posiciones
+            try {
+                const metrics = (0, metrics_1.getMetrics)();
+                metrics.updateTradingMetrics({
+                    positionsOpen: positions.length
+                });
+                if (positions.length > 0) {
+                    const position = positions[0];
+                    metrics.updateTradingMetrics({
+                        positionPnlPercent: position.pnlPercentage,
+                        positionSize: position.size,
+                        positionLeverage: position.leverage || 1
+                    });
+                    // Actualizar PnL
+                    const balance = await this.bybit.getBalance();
+                    metrics.updateTradingMetrics({
+                        pnlUnrealized: position.pnl || 0,
+                        balanceAvailable: balance.availableBalance,
+                        balanceTotal: balance.totalBalance
+                    });
+                }
+            }
+            catch (error) {
+                // Ignorar error de métricas
+            }
+            if (positions.length === 0) {
+                return; // No hay posiciones que gestionar
+            }
+            for (const position of positions) {
+                this.logger.info(`📊 Gestionando posición: ${position.side} ${position.size} ${position.symbol} | PnL: ${position.pnlPercentage.toFixed(2)}%`);
+                // Inicializar tracking si no existe
+                const trackingKey = `${position.symbol}_${position.side}`;
+                if (!this.positionTracking.has(trackingKey)) {
+                    this.positionTracking.set(trackingKey, {
+                        symbol: position.symbol,
+                        side: position.side,
+                        entryPrice: position.entryPrice,
+                        entryTime: Date.now(),
+                        maxPriceReached: position.currentPrice,
+                        minPriceReached: position.currentPrice,
+                        trailingStopActive: false,
+                        profitLadderExecuted: [],
+                        lastOrderCheckTime: Date.now() - 300000 // Últimos 5 minutos
+                    });
+                }
+                const tracking = this.positionTracking.get(trackingKey);
+                // Verificar si hubo ejecuciones de TP/SL por Bybit
+                try {
+                    const tpslCheck = await this.bybit.checkTPSLExecutions(position.symbol, tracking.lastOrderCheckTime);
+                    if (tpslCheck.tpExecuted) {
+                        this.logger.info(`🎯 TAKE PROFIT EJECUTADO por Bybit para ${position.symbol}`);
+                        this.logger.info(`💰 Detalles: ${JSON.stringify(tpslCheck.orders[0], null, 2)}`);
+                        // Loguear evento para Grafana
+                        this.logger.info('TRADE_CLOSE', {
+                            symbol: position.symbol,
+                            side: position.side,
+                            type: 'TAKE_PROFIT',
+                            executedBy: 'Bybit',
+                            pnl: position.pnl,
+                            pnlPercentage: position.pnlPercentage,
+                            timestamp: Date.now()
+                        });
+                        // Registrar cierre en Redis
+                        if (tracking.tradeId) {
+                            const durationMinutes = (Date.now() - tracking.entryTime) / (1000 * 60);
+                            await this.redisHistory.recordTradeClose(tracking.tradeId, {
+                                type: 'TAKE_PROFIT',
+                                price: position.currentPrice,
+                                pnl: position.pnl,
+                                pnlPercent: position.pnlPercentage,
+                                durationMinutes
+                            });
+                        }
+                        // Actualizar métricas
+                        const metrics = (0, metrics_1.getMetrics)();
+                        metrics.recordTrade(position.side === 'Buy' ? 'buy' : 'sell', true);
+                    }
+                    if (tpslCheck.slExecuted) {
+                        this.logger.info(`🛑 STOP LOSS EJECUTADO por Bybit para ${position.symbol}`);
+                        this.logger.info(`💔 Detalles: ${JSON.stringify(tpslCheck.orders[0], null, 2)}`);
+                        // Loguear evento para Grafana
+                        this.logger.info('TRADE_CLOSE', {
+                            symbol: position.symbol,
+                            side: position.side,
+                            type: 'STOP_LOSS',
+                            executedBy: 'Bybit',
+                            pnl: position.pnl,
+                            pnlPercentage: position.pnlPercentage,
+                            timestamp: Date.now()
+                        });
+                        // Registrar cierre en Redis
+                        if (tracking.tradeId) {
+                            const durationMinutes = (Date.now() - tracking.entryTime) / (1000 * 60);
+                            await this.redisHistory.recordTradeClose(tracking.tradeId, {
+                                type: 'STOP_LOSS',
+                                price: position.currentPrice,
+                                pnl: position.pnl,
+                                pnlPercent: position.pnlPercentage,
+                                durationMinutes
+                            });
+                        }
+                        // Actualizar métricas
+                        const metrics = (0, metrics_1.getMetrics)();
+                        metrics.recordTrade(position.side === 'Buy' ? 'buy' : 'sell', false);
+                    }
+                    // Actualizar timestamp de última verificación
+                    tracking.lastOrderCheckTime = Date.now();
+                }
+                catch (error) {
+                    this.logger.debug('Error verificando órdenes TP/SL:', error);
+                }
+                // Actualizar precios máximo/mínimo
+                if (position.side === 'Buy') {
+                    tracking.maxPriceReached = Math.max(tracking.maxPriceReached, position.currentPrice);
+                }
+                else {
+                    tracking.minPriceReached = Math.min(tracking.minPriceReached, position.currentPrice);
+                }
+                // Verificar y actualizar trailing stop
+                await this.updateTrailingStop(position, tracking, analysis);
+                // PRIMERO: Consultar a Ollama/IA sobre la posición
+                const timeInPosition = (Date.now() - tracking.entryTime) / (1000 * 60 * 60); // Horas
+                const marketData = await this.bybit.getMarketData(position.symbol);
+                this.logger.info(`🤖 Consultando IA sobre posición ${position.symbol}...`);
+                const aiDecision = await this.ollama.analyzePosition(position, marketData, analysis.technical, analysis.kalman, timeInPosition);
+                this.logger.info(`📊 IA: ${aiDecision.action} | Razón: ${aiDecision.reasoning.substring(0, 100)}...`);
+                // Si IA sugiere cerrar, ejecutar
+                if (aiDecision.action !== 'HOLD') {
+                    const exitDecision = {
+                        action: aiDecision.action === 'CLOSE_100' ? 'CLOSE_FULL' : aiDecision.action,
+                        bestStrategy: {
+                            name: 'AI_DECISION',
+                            reason: aiDecision.reasoning,
+                            score: aiDecision.confidence
+                        },
+                        strategies: [{
+                                name: 'AI_DECISION',
+                                triggered: true,
+                                score: aiDecision.confidence,
+                                reason: aiDecision.reasoning,
+                                action: aiDecision.action === 'CLOSE_100' ? 'CLOSE_FULL' : aiDecision.action
+                            }],
+                        reasons: [aiDecision.reasoning]
+                    };
+                    await this.executeExitAction(position, exitDecision);
+                    // Si cerramos completamente, limpiar tracking
+                    if (exitDecision.action === 'CLOSE_FULL') {
+                        this.positionTracking.delete(trackingKey);
+                    }
+                }
+                else {
+                    // Si IA dice HOLD, evaluar estrategias automáticas de respaldo
+                    this.logger.info('IA sugiere HOLD, evaluando estrategias de respaldo...');
+                    const exitDecision = await this.evaluateExitStrategies(position, tracking, analysis);
+                    // Ejecutar acción recomendada
+                    if (exitDecision.action !== 'HOLD') {
+                        await this.executeExitAction(position, exitDecision);
+                        // Si cerramos completamente, limpiar tracking
+                        if (exitDecision.action === 'CLOSE_FULL') {
+                            this.positionTracking.delete(trackingKey);
+                        }
+                    }
+                }
+            }
+        }
+        catch (error) {
+            this.logger.error('Error gestionando posiciones existentes:', error);
+        }
+    }
+    /**
+     * Actualiza el trailing stop de una posición
+     */
+    async updateTrailingStop(position, tracking, _analysis) {
+        try {
+            const pnlPercentage = position.pnlPercentage;
+            const TRAILING_ACTIVATION_THRESHOLD = 0.5; // SCALPING: Activar trailing con solo 0.5% ganancia
+            const TRAILING_DISTANCE = 0.3; // SCALPING: Mantener SL a 0.3% del máximo alcanzado
+            // Activar trailing stop si tenemos suficiente ganancia
+            if (pnlPercentage >= TRAILING_ACTIVATION_THRESHOLD && !tracking.trailingStopActive) {
+                tracking.trailingStopActive = true;
+                this.logger.info(`🎯 Trailing stop ACTIVADO para ${position.symbol} (PnL: ${pnlPercentage.toFixed(2)}%)`);
+            }
+            // Si el trailing stop está activo, actualizar SL
+            if (tracking.trailingStopActive) {
+                let newStopLoss;
+                if (position.side === 'Buy') {
+                    // Para LONG: SL = maxPrice * 0.98 (2% bajo el máximo)
+                    newStopLoss = tracking.maxPriceReached * (1 - TRAILING_DISTANCE / 100);
+                    // Solo actualizar si el nuevo SL es más alto que el actual
+                    if (newStopLoss > position.entryPrice * 0.98) { // Asegurar que esté por encima del SL original
+                        this.logger.info(`📈 Actualizando trailing SL: ${newStopLoss.toFixed(2)} (Max alcanzado: ${tracking.maxPriceReached.toFixed(2)})`);
+                        await this.bybit.updatePositionStopLoss(position.symbol, newStopLoss);
+                    }
+                }
+                else {
+                    // Para SHORT: SL = minPrice * 1.02 (2% sobre el mínimo)
+                    newStopLoss = tracking.minPriceReached * (1 + TRAILING_DISTANCE / 100);
+                    // Solo actualizar si el nuevo SL es más bajo que el actual
+                    if (newStopLoss < position.entryPrice * 1.02) {
+                        this.logger.info(`📉 Actualizando trailing SL: ${newStopLoss.toFixed(2)} (Min alcanzado: ${tracking.minPriceReached.toFixed(2)})`);
+                        await this.bybit.updatePositionStopLoss(position.symbol, newStopLoss);
+                    }
+                }
+            }
+        }
+        catch (error) {
+            this.logger.error('Error actualizando trailing stop:', error);
+        }
+    }
+    /**
+     * Evalúa todas las estrategias de salida y retorna recomendación
+     */
+    async evaluateExitStrategies(position, tracking, analysis) {
+        const strategies = [];
+        const { ai, technical } = analysis;
+        const timeInPosition = (Date.now() - tracking.entryTime) / (1000 * 60 * 60); // Horas
+        const pnlPercentage = position.pnlPercentage;
+        // ESTRATEGIA 1: Señal contraria de IA
+        if ((position.side === 'Buy' && ai.decision === 'SELL' && ai.confidence > 0.7) ||
+            (position.side === 'Sell' && ai.decision === 'BUY' && ai.confidence > 0.7)) {
+            strategies.push({
+                name: 'AI_REVERSAL_SIGNAL',
+                triggered: true,
+                score: 1.0,
+                reason: `IA sugiere ${ai.decision} con ${(ai.confidence * 100).toFixed(0)}% confianza`,
+                action: 'CLOSE_FULL'
+            });
+        }
+        // ESTRATEGIA 2: Time-based exit - SCALPING: más agresivo
+        if (timeInPosition > 2 && pnlPercentage < 0.3) {
+            strategies.push({
+                name: 'POSITION_STALE',
+                triggered: true,
+                score: 0.6,
+                reason: `Posición abierta ${timeInPosition.toFixed(1)}h sin movimiento (scalping)`,
+                action: 'CLOSE_FULL'
+            });
+        }
+        // ESTRATEGIA 3: Volatility spike exit
+        if (technical.volume.ratio > 5) {
+            strategies.push({
+                name: 'VOLATILITY_SPIKE',
+                triggered: true,
+                score: 0.7,
+                reason: `Volumen ${technical.volume.ratio.toFixed(1)}x promedio - posible reversión`,
+                action: 'CLOSE_50'
+            });
+        }
+        // ESTRATEGIA 4: Profit ladder - SCALPING: niveles más bajos y agresivos
+        if (pnlPercentage >= 0.3 && !tracking.profitLadderExecuted.includes(30)) {
+            strategies.push({
+                name: 'PROFIT_LADDER_30',
+                triggered: true,
+                score: 0.5,
+                reason: `PnL ${pnlPercentage.toFixed(2)}% - scalping: asegurar ganancia mínima`,
+                action: 'CLOSE_25'
+            });
+        }
+        else if (pnlPercentage >= 0.6 && !tracking.profitLadderExecuted.includes(60)) {
+            strategies.push({
+                name: 'PROFIT_LADDER_60',
+                triggered: true,
+                score: 0.6,
+                reason: `PnL ${pnlPercentage.toFixed(2)}% - scalping: tomar profit parcial`,
+                action: 'CLOSE_50'
+            });
+        }
+        else if (pnlPercentage >= 1.0 && !tracking.profitLadderExecuted.includes(100)) {
+            strategies.push({
+                name: 'PROFIT_LADDER_100',
+                triggered: true,
+                score: 0.9,
+                reason: `PnL ${pnlPercentage.toFixed(2)}% - scalping: excelente ganancia, cerrar todo`,
+                action: 'CLOSE_FULL'
+            });
+        }
+        // ESTRATEGIA 5: RSI extremo + MACD contradicción
+        if (position.side === 'Buy') {
+            if (technical.rsi > 80 && technical.macd.histogram < 0) {
+                strategies.push({
+                    name: 'TECHNICAL_REVERSAL',
+                    triggered: true,
+                    score: 0.75,
+                    reason: 'RSI sobrecompra extrema + MACD bearish',
+                    action: 'CLOSE_50'
+                });
+            }
+        }
+        else {
+            if (technical.rsi < 20 && technical.macd.histogram > 0) {
+                strategies.push({
+                    name: 'TECHNICAL_REVERSAL',
+                    triggered: true,
+                    score: 0.75,
+                    reason: 'RSI sobreventa extrema + MACD bullish',
+                    action: 'CLOSE_50'
+                });
+            }
+        }
+        // Decidir acción basada en la estrategia con mayor score
+        if (strategies.length > 0) {
+            const bestStrategy = strategies.reduce((prev, current) => (prev.score > current.score) ? prev : current);
+            this.logger.info(`⚠️  Estrategia activada: ${bestStrategy.name} - ${bestStrategy.reason}`);
+            return {
+                action: bestStrategy.action,
+                strategies,
+                bestStrategy,
+                reasons: strategies.map(s => s.reason)
+            };
+        }
+        return { action: 'HOLD', strategies: [], reasons: [] };
+    }
+    /**
+     * Ejecuta la acción de salida recomendada
+     */
+    async executeExitAction(position, exitDecision) {
+        try {
+            const { action, bestStrategy } = exitDecision;
+            const trackingKey = `${position.symbol}_${position.side}`;
+            const tracking = this.positionTracking.get(trackingKey);
+            switch (action) {
+                case 'CLOSE_FULL':
+                case 'CLOSE_100':
+                    this.logger.info(`🔴 CERRANDO POSICIÓN COMPLETA: ${bestStrategy.reason}`);
+                    await this.bybit.closePosition(position.symbol, position.side, 100);
+                    this.logger.info(`💰 Posición cerrada. PnL final: ${position.pnl.toFixed(2)} USDT (${position.pnlPercentage.toFixed(3)}%)`);
+                    // Registrar cierre en Redis
+                    if (tracking?.tradeId) {
+                        const durationMinutes = (Date.now() - tracking.entryTime) / (1000 * 60);
+                        await this.redisHistory.recordTradeClose(tracking.tradeId, {
+                            type: 'MANUAL_CLOSE',
+                            price: position.currentPrice,
+                            pnl: position.pnl,
+                            pnlPercent: position.pnlPercentage,
+                            durationMinutes
+                        });
+                    }
+                    break;
+                case 'CLOSE_50':
+                    this.logger.info(`🟡 CERRANDO 50% DE POSICIÓN: ${bestStrategy.reason}`);
+                    await this.bybit.closePosition(position.symbol, position.side, 50);
+                    this.logger.info(`💰 50% cerrado. PnL parcial: ${(position.pnl / 2).toFixed(2)} USDT`);
+                    break;
+                case 'CLOSE_25':
+                    this.logger.info(`🟢 CERRANDO 25% DE POSICIÓN: ${bestStrategy.reason}`);
+                    await this.bybit.closePosition(position.symbol, position.side, 25);
+                    this.logger.info(`💰 25% cerrado. PnL parcial: ${(position.pnl / 4).toFixed(2)} USDT`);
+                    // Marcar nivel de profit ladder como ejecutado
+                    if (tracking && bestStrategy.name.includes('PROFIT_LADDER')) {
+                        const levelMatch = bestStrategy.name.match(/\d+$/);
+                        if (levelMatch) {
+                            const level = parseInt(levelMatch[0]);
+                            tracking.profitLadderExecuted.push(level);
+                        }
+                    }
+                    break;
+            }
+            this.logger.info(`✅ Acción ejecutada exitosamente`);
+        }
+        catch (error) {
+            this.logger.error('Error ejecutando acción de salida:', error);
+        }
+    }
+    /**
+     * Calcula el leverage óptimo - AJUSTADO PARA SCALPING (MÁS CONSERVADOR)
      */
     calculateOptimalLeverage(ai, technical, kalman) {
-        let leverage = 5; // Base más alta
-        // Ajustar según confianza de IA
+        let leverage = 5; // Base conservadora para scalping
+        // Ajustar según confianza de IA (más conservador)
         if (ai.confidence > 0.9)
-            leverage += 20;
+            leverage += 10;
         else if (ai.confidence > 0.8)
-            leverage += 15;
+            leverage += 7;
         else if (ai.confidence > 0.7)
-            leverage += 10;
+            leverage += 5;
         else if (ai.confidence > 0.6)
+            leverage += 3;
+        // Ajustar según predicción Kalman (más conservador)
+        if (kalman.confidence > 0.85)
             leverage += 5;
-        // Ajustar según predicción Kalman
-        if (kalman.confidence > 0.8)
-            leverage += 10;
-        else if (kalman.confidence > 0.7)
-            leverage += 5;
+        else if (kalman.confidence > 0.75)
+            leverage += 3;
         // Ajustar según RSI (señales fuertes)
         if (technical.rsi < 25 || technical.rsi > 75)
-            leverage += 10;
-        else if (technical.rsi < 30 || technical.rsi > 70)
             leverage += 5;
+        else if (technical.rsi < 30 || technical.rsi > 70)
+            leverage += 2;
         // Ajustar según MACD
         if (Math.abs(technical.macd.histogram) > 0.001)
-            leverage += 5;
+            leverage += 2;
         // Ajustar según volumen
         if (technical.volume.ratio > 2)
-            leverage += 5;
-        // Limitar leverage máximo a 50x
-        return Math.min(leverage, 50);
+            leverage += 2;
+        // Para scalping: Limitar leverage máximo a 20x (más seguro)
+        return Math.min(leverage, 20);
     }
     /**
      * Calcula el tamaño de posición - OPTIMIZADO PARA APALANCAMIENTO ALTO
@@ -290,29 +748,57 @@ class TradingStrategy {
     async calculatePositionSize(symbol, price, leverage) {
         try {
             const balance = await this.bybit.getBalance();
+            this.logger.info(`Balance disponible: $${balance.availableBalance.toFixed(2)}, Precio: $${price}`);
             const symbolInfo = await this.bybit.getSymbolInfo(symbol);
-            // Para apalancamiento alto, usar más del balance disponible - MÁS AGRESIVO
-            const riskPercentage = Math.min(20, leverage / 2); // 1% a 20% según leverage
-            const maxPositionValue = balance.availableBalance * (riskPercentage / 100);
-            // Con apalancamiento alto, podemos usar más capital
-            const positionValue = maxPositionValue * leverage;
+            this.logger.debug(`Símbolo info - Min: ${symbolInfo.minOrderQty}, Step: ${symbolInfo.stepSize}`);
+            // Validar inputs
+            if (!balance.availableBalance || balance.availableBalance <= 0) {
+                this.logger.error('Balance disponible es inválido');
+                return 0.001;
+            }
+            if (!price || price <= 0) {
+                this.logger.error('Precio es inválido');
+                return 0.001;
+            }
+            // Para scalping: usar porcentaje MÁS CONSERVADOR del balance
+            // Con leverage 15x y riskPercentage 7.5%, usamos ~$3k del balance disponible ($40k)
+            // Eso nos da una posición de ~$45k con 15x leverage
+            const riskPercentage = Math.min(10, leverage / 3); // 1.6% a 10% según leverage (más conservador)
+            const capitalToRisk = balance.availableBalance * (riskPercentage / 100);
+            this.logger.info(`Riesgo: ${riskPercentage}%, Capital a arriesgar: $${capitalToRisk.toFixed(2)}`);
+            // El valor de la posición es el capital multiplicado por el leverage
+            const positionValue = capitalToRisk * leverage;
+            // Cantidad en BTC (o la moneda base)
             const quantity = positionValue / price;
+            this.logger.info(`Position value: $${positionValue.toFixed(2)}, Quantity raw: ${quantity.toFixed(6)}`);
+            // Validar que la cantidad no es NaN
+            if (isNaN(quantity) || quantity <= 0) {
+                this.logger.error(`Cantidad calculada es inválida: ${quantity}`);
+                return 0.001;
+            }
             // Redondear según step size del símbolo
-            const stepSize = symbolInfo.stepSize;
-            const finalQuantity = Math.floor(quantity / stepSize) * stepSize;
-            // Mínimo de 0.001 para asegurar que hay posición
-            return Math.max(finalQuantity, 0.001);
+            const stepSize = symbolInfo.stepSize || 0.001;
+            let finalQuantity = Math.floor(quantity / stepSize) * stepSize;
+            // Asegurar que cumple el mínimo
+            const minQty = symbolInfo.minOrderQty || 0.001;
+            if (finalQuantity < minQty) {
+                finalQuantity = minQty;
+                this.logger.warn(`Cantidad ajustada al mínimo: ${finalQuantity}`);
+            }
+            this.logger.info(`Cantidad final calculada: ${finalQuantity} ${symbol.replace('USDT', '')} (valor: $${(finalQuantity * price).toFixed(2)})`);
+            return finalQuantity;
         }
         catch (error) {
             this.logger.error('Error calculando tamaño de posición:', error);
-            return 0.001; // Mínimo para testing
+            // Retornar cantidad mínima por defecto
+            return 0.001;
         }
     }
     /**
-     * Calcula el stop loss
+     * Calcula el stop loss - AJUSTADO PARA SCALPING
      */
     calculateStopLoss(price, decision, _technical) {
-        const stopLossPercentage = 0.02; // 2%
+        const stopLossPercentage = 0.006; // 0.6% - Más conservador para scalping
         if (decision === 'BUY') {
             return price * (1 - stopLossPercentage);
         }
@@ -321,10 +807,11 @@ class TradingStrategy {
         }
     }
     /**
-     * Calcula el take profit
+     * Calcula el take profit - AJUSTADO PARA SCALPING
      */
     calculateTakeProfit(price, stopLoss, confidence) {
-        const riskRewardRatio = 2 + (confidence * 2); // 2-4 basado en confianza
+        // Para scalping: TP más conservador, 1.5-2x el riesgo
+        const riskRewardRatio = 1.5 + (confidence * 0.5); // 1.5-2.0 basado en confianza
         const stopLossDistance = Math.abs(price - stopLoss);
         const takeProfitDistance = stopLossDistance * riskRewardRatio;
         return price > stopLoss
@@ -334,52 +821,94 @@ class TradingStrategy {
     /**
      * Construye el prompt para IA - OPTIMIZADO PARA TRADING AGRESIVO
      */
-    buildAIPrompt(marketData, technical, kalman, klines) {
+    buildAIPrompt(marketData, technical, kalman, klines, historicalContext) {
         const recentPrices = klines.slice(-10).map(k => k.close);
         const priceChange = ((recentPrices[recentPrices.length - 1] - recentPrices[0]) / recentPrices[0]) * 100;
+        // Detectar contexto actual
+        const isBullishContext = technical.rsi < 50 && technical.macd.histogram > 0 && priceChange > 0;
+        const isBearishContext = technical.rsi > 50 && technical.macd.histogram < 0 && priceChange < 0;
+        // Construir prompt con contexto histórico si está disponible
+        let promptWithHistory = '';
+        if (historicalContext && (historicalContext.recent.length > 0 || historicalContext.daily.trades > 0)) {
+            promptWithHistory = this.redisHistory.formatContextForPrompt(historicalContext);
+        }
         return `
-Eres un trader profesional especializado en trading de alta frecuencia con apalancamiento. 
-Analiza la siguiente información y toma decisiones AGRESIVAS basadas en señales claras:
+${promptWithHistory}Eres un trader profesional de SCALPING bidireccional. Puedes ganar tanto en subidas (LONG/BUY) como en bajadas (SHORT/SELL).
+IMPORTANTE: En crypto, los precios BAJAN tan rápido (o más rápido) que suben. Un SHORT puede ser tan rentable como un LONG.
+
+⚠️  REGLA CRÍTICA: Solo puedes tener UNA posición a la vez (o LONG o SHORT, nunca ambos). Si detectas que debes cambiar de dirección, primero cierras la posición existente (se hace automáticamente) y luego sugieres la nueva dirección.
 
 DATOS DE MERCADO:
 - Precio actual: $${marketData.price}
 - Cambio 24h: ${marketData.change24h.toFixed(2)}%
 - Volumen 24h: ${marketData.volume}
-- Cambio reciente: ${priceChange.toFixed(2)}%
+- Cambio reciente (últimos 10 velas): ${priceChange.toFixed(2)}% ${priceChange > 0 ? '📈' : priceChange < 0 ? '📉' : '➡️'}
 
 INDICADORES TÉCNICOS:
-- RSI: ${technical.rsi.toFixed(2)} ${technical.rsi < 30 ? '(OVERSOLD - SEÑAL COMPRA)' : technical.rsi > 70 ? '(OVERBOUGHT - SEÑAL VENTA)' : ''}
-- MACD: ${technical.macd.macd.toFixed(4)} (Signal: ${technical.macd.signal.toFixed(4)}) ${technical.macd.histogram > 0 ? '(BULLISH)' : '(BEARISH)'}
+- RSI: ${technical.rsi.toFixed(2)} ${technical.rsi < 30 ? '🟢 OVERSOLD (señal LONG)' : technical.rsi > 70 ? '🔴 OVERBOUGHT (señal SHORT)' : technical.rsi > 60 ? '⚠️  Alto (posible SHORT)' : technical.rsi < 40 ? '⚠️  Bajo (posible LONG)' : ''}
+- MACD Histogram: ${technical.macd.histogram.toFixed(6)} ${technical.macd.histogram > 0 ? '🟢 BULLISH' : '🔴 BEARISH'}
+- MACD: ${technical.macd.macd.toFixed(4)} vs Signal: ${technical.macd.signal.toFixed(4)}
 - Bollinger: Superior ${technical.bollinger.upper.toFixed(2)}, Medio ${technical.bollinger.middle.toFixed(2)}, Inferior ${technical.bollinger.lower.toFixed(2)}
-- EMA9: ${technical.ema.ema9.toFixed(2)}, EMA21: ${technical.ema.ema21.toFixed(2)}, EMA50: ${technical.ema.ema50.toFixed(2)}
-- Volumen: ${technical.volume.ratio.toFixed(2)}x promedio ${technical.volume.ratio > 1.5 ? '(ALTO VOLUMEN)' : ''}
+  ${marketData.price > technical.bollinger.upper ? '🔴 Precio SOBRE banda superior (señal SHORT)' : marketData.price < technical.bollinger.lower ? '🟢 Precio BAJO banda inferior (señal LONG)' : ''}
+- EMAs: EMA9: ${technical.ema.ema9.toFixed(2)}, EMA21: ${technical.ema.ema21.toFixed(2)}, EMA50: ${technical.ema.ema50.toFixed(2)}
+  ${technical.ema.ema9 < technical.ema.ema21 && technical.ema.ema21 < technical.ema.ema50 ? '🔴 Death Cross (tendencia BAJISTA)' : technical.ema.ema9 > technical.ema.ema21 && technical.ema.ema21 > technical.ema.ema50 ? '🟢 Golden Cross (tendencia ALCISTA)' : ''}
+- Volumen: ${technical.volume.ratio.toFixed(2)}x promedio ${technical.volume.ratio > 1.5 ? '⚡ ALTO VOLUMEN (movimiento fuerte)' : ''}
 
 PREDICCIÓN KALMAN:
-- Precio predicho: $${kalman.predictedPrice.toFixed(2)}
+- Precio predicho: $${kalman.predictedPrice.toFixed(2)} (${kalman.predictedPrice > marketData.price ? '📈 +' : '📉 '}${((kalman.predictedPrice - marketData.price) / marketData.price * 100).toFixed(2)}%)
 - Confianza: ${(kalman.confidence * 100).toFixed(1)}%
-- Tendencia: ${kalman.trend}
+- Tendencia: ${kalman.trend === 'bullish' ? '🟢 ALCISTA' : kalman.trend === 'bearish' ? '🔴 BAJISTA' : '➡️  LATERAL'}
 - Precisión: ${(kalman.accuracy * 100).toFixed(1)}%
 
-INSTRUCCIONES DE TRADING:
-- Si RSI < 30 y MACD bullish → COMPRA AGRESIVA
-- Si RSI > 70 y MACD bearish → VENTA AGRESIVA  
-- Si Kalman predice subida con alta confianza → COMPRA
-- Si Kalman predice bajada con alta confianza → VENTA
-- Si hay alta volatilidad y volumen → TRADING AGRESIVO
-- Usa leverage alto (10-50x) para señales fuertes
-- Solo HOLD si no hay señales claras
+═══════════════════════════════════════════════════════════════
+📊 REGLAS DE DECISIÓN (BALANCEADAS LONG/SHORT):
+═══════════════════════════════════════════════════════════════
 
-Proporciona tu decisión en formato JSON:
+🔴 SEÑALES PARA **SHORT** (SELL - apostar a la BAJADA):
+1. RSI > 70 (sobrecompra) + MACD bearish → SHORT AGRESIVO
+2. RSI entre 60-70 + MACD cruzando a negativo → SHORT MODERADO
+3. Precio SOBRE Bollinger superior + volumen alto → SHORT (reversión inminente)
+4. EMA9 cruza por DEBAJO de EMA21 → SHORT (death cross)
+5. Kalman predice BAJADA con confianza > 75% → SHORT
+6. Cambio reciente > +2% en 10 velas + RSI > 65 → SHORT (toma de ganancias esperada)
+7. MACD histogram negativo Y decreciendo → SHORT (momentum bajista)
+
+🟢 SEÑALES PARA **LONG** (BUY - apostar a la SUBIDA):
+1. RSI < 30 (sobreventa) + MACD bullish → LONG AGRESIVO
+2. RSI entre 30-40 + MACD cruzando a positivo → LONG MODERADO
+3. Precio BAJO Bollinger inferior + volumen alto → LONG (reversión inminente)
+4. EMA9 cruza por ENCIMA de EMA21 → LONG (golden cross)
+5. Kalman predice SUBIDA con confianza > 75% → LONG
+6. Cambio reciente < -2% en 10 velas + RSI < 35 → LONG (oversold extremo)
+7. MACD histogram positivo Y creciendo → LONG (momentum alcista)
+
+⚪ SEÑALES PARA **HOLD**:
+- RSI entre 45-55 + MACD cerca de 0 → HOLD (mercado indeciso)
+- Volumen bajo (<0.8x promedio) → HOLD (falta convicción)
+- Kalman confianza < 60% → HOLD (predicción incierta)
+
+═══════════════════════════════════════════════════════════════
+
+IMPORTANTE:
+✅ En scalping, los SHORTS son TAN IMPORTANTES como los LONGS
+✅ Las caídas en crypto son RÁPIDAS y VIOLENTAS (alta volatilidad)
+✅ NO tengas sesgo alcista: evalúa OBJETIVAMENTE
+✅ Si hay señales bajistas CLARAS → SELL/SHORT sin miedo
+✅ Usa leverage alto (10-50x) SOLO con señales muy claras
+✅ En duda → HOLD (mejor perder una oportunidad que perder dinero)
+
+Responde en formato JSON:
 {
   "decision": "BUY|SELL|HOLD",
   "confidence": 0.0-1.0,
-  "reasoning": "Explicación detallada de la señal",
+  "reasoning": "Explicación detallada mencionando ESPECÍFICAMENTE qué indicadores apoyan tu decisión (RSI, MACD, Bollinger, EMA, Kalman)",
   "suggestedLeverage": 10-50,
   "riskLevel": "low|medium|high",
   "marketSentiment": "bullish|bearish|neutral"
 }
 
-Sé AGRESIVO y toma decisiones basadas en señales claras. Evita HOLD a menos que sea absolutamente necesario.
+CONTEXTO ACTUAL DETECTADO: ${isBullishContext ? '🟢 Ligeramente alcista' : isBearishContext ? '🔴 Ligeramente bajista' : '⚪ Neutral'}
+Analiza OBJETIVAMENTE y decide. Si detectas señales bajistas, NO dudes en sugerir SELL/SHORT.
     `;
     }
     /**
@@ -388,6 +917,17 @@ Sé AGRESIVO y toma decisiones basadas en señales claras. Evita HOLD a menos qu
     async healthCheck() {
         const ollamaHealth = await this.ollama.healthCheck();
         const bybitHealth = await this.bybit.healthCheck();
+        // Actualizar métricas de salud
+        try {
+            const metrics = (0, metrics_1.getMetrics)();
+            metrics.updateHealthMetrics({
+                ollamaHealth,
+                bybitHealth
+            });
+        }
+        catch (error) {
+            // Ignorar error si métricas no están inicializadas
+        }
         if (!ollamaHealth) {
             throw new Error('Ollama no está disponible');
         }

@@ -286,6 +286,171 @@ class TechnicalAnalysis {
         const variance = recentReturns.reduce((sum, r) => sum + Math.pow(r - mean, 2), 0) / recentReturns.length;
         return Math.sqrt(variance) * Math.sqrt(365 * 24 * 12); // Anualizada para 5min
     }
+    /**
+     * Detecta patrones de velas en corto plazo (para scalping)
+     */
+    detectCandlePatterns(klines) {
+        if (klines.length < 10) {
+            return { patterns: [], lastCandles: [] };
+        }
+        const patterns = [];
+        const recentCandles = klines.slice(-10);
+        const last3 = klines.slice(-3);
+        // Analizar últimas velas
+        const lastCandles = recentCandles.map(k => ({
+            color: k.close > k.open ? 'green' : 'red',
+            bodySize: Math.abs(k.close - k.open) / k.open,
+            volume: k.volume,
+            timestamp: k.openTime
+        }));
+        // Patrón: 3 Velas Rojas Consecutivas (THREE_RED_SOLDIERS)
+        if (last3.every(k => k.close < k.open)) {
+            const avgBodySize = last3.reduce((sum, k) => sum + Math.abs(k.close - k.open), 0) / 3;
+            patterns.push({
+                type: 'THREE_RED_SOLDIERS',
+                confidence: 0.75,
+                suggests: 'SHORT',
+                reason: `3 velas rojas consecutivas con tamaño promedio ${(avgBodySize / last3[0].open * 100).toFixed(2)}%`
+            });
+        }
+        // Patrón: 3 Velas Verdes Consecutivas (THREE_GREEN_SOLDIERS)
+        if (last3.every(k => k.close > k.open)) {
+            const avgBodySize = last3.reduce((sum, k) => sum + Math.abs(k.close - k.open), 0) / 3;
+            patterns.push({
+                type: 'THREE_GREEN_SOLDIERS',
+                confidence: 0.75,
+                suggests: 'LONG',
+                reason: `3 velas verdes consecutivas con tamaño promedio ${(avgBodySize / last3[0].open * 100).toFixed(2)}%`
+            });
+        }
+        // Patrón: Momentum Decreciente (velas cada vez más pequeñas)
+        const bodySizes = last3.map(k => Math.abs(k.close - k.open));
+        const isDecreasing = bodySizes[0] > bodySizes[1] && bodySizes[1] > bodySizes[2];
+        if (isDecreasing) {
+            patterns.push({
+                type: 'MOMENTUM_WEAKENING',
+                confidence: 0.6,
+                suggests: 'CLOSE_POSITION',
+                reason: 'Momentum decreciente: velas cada vez más pequeñas'
+            });
+        }
+        // Patrón: Volume Spike (volumen 3x promedio)
+        const avgVolume = recentCandles.slice(0, -1).reduce((sum, k) => sum + k.volume, 0) / (recentCandles.length - 1);
+        const lastVolume = recentCandles[recentCandles.length - 1].volume;
+        if (lastVolume > avgVolume * 3) {
+            patterns.push({
+                type: 'VOLUME_SPIKE',
+                confidence: 0.8,
+                suggests: 'REVERSAL_INCOMING',
+                reason: `Volumen ${(lastVolume / avgVolume).toFixed(1)}x el promedio - posible reversión`
+            });
+        }
+        // Patrón: Doji (indecisión)
+        const lastCandle = last3[last3.length - 1];
+        const bodyPercent = Math.abs(lastCandle.close - lastCandle.open) / (lastCandle.high - lastCandle.low);
+        if (bodyPercent < 0.1) {
+            patterns.push({
+                type: 'DOJI',
+                confidence: 0.65,
+                suggests: 'WAIT',
+                reason: 'Doji detectado - indecisión del mercado'
+            });
+        }
+        return { patterns, lastCandles };
+    }
+    /**
+     * Analiza Order Book para detectar presión de compra/venta y walls
+     */
+    analyzeOrderBook(orderBook) {
+        const { bids, asks } = orderBook;
+        // Calcular liquidez total
+        const totalBidLiquidity = bids.reduce((sum, bid) => sum + bid.quantity, 0);
+        const totalAskLiquidity = asks.reduce((sum, ask) => sum + ask.quantity, 0);
+        // Imbalance (> 1 = más compradores, < 1 = más vendedores)
+        const bidAskImbalance = totalBidLiquidity / (totalAskLiquidity || 1);
+        // Spread
+        const bestBid = bids[0]?.price || 0;
+        const bestAsk = asks[0]?.price || 0;
+        const spread = bestAsk - bestBid;
+        const spreadPercent = (spread / bestBid) * 100;
+        // Detectar "walls" (órdenes grandes que actúan como soporte/resistencia)
+        const avgBidQty = totalBidLiquidity / bids.length;
+        const avgAskQty = totalAskLiquidity / asks.length;
+        const bidWalls = bids.filter(bid => bid.quantity > avgBidQty * 3).slice(0, 5);
+        const askWalls = asks.filter(ask => ask.quantity > avgAskQty * 3).slice(0, 5);
+        // Determinar presión del mercado
+        let pressure;
+        let confidence;
+        if (bidAskImbalance > 1.5) {
+            pressure = 'BULLISH';
+            confidence = Math.min((bidAskImbalance - 1) / 2, 0.9);
+        }
+        else if (bidAskImbalance < 0.67) {
+            pressure = 'BEARISH';
+            confidence = Math.min((1 - bidAskImbalance) / 0.5, 0.9);
+        }
+        else {
+            pressure = 'NEUTRAL';
+            confidence = 0.5;
+        }
+        return {
+            bidAskImbalance,
+            spread,
+            spreadPercent,
+            bidWalls,
+            askWalls,
+            totalBidLiquidity,
+            totalAskLiquidity,
+            pressure,
+            confidence
+        };
+    }
+    /**
+     * Compara tendencia en diferentes timeframes para detectar divergencias
+     */
+    compareTrends(klines1m, klines5m) {
+        // Tendencia macro (5m) - últimas 20 velas
+        const macro5m = klines5m.slice(-20);
+        const macroChange = (macro5m[macro5m.length - 1].close - macro5m[0].close) / macro5m[0].close;
+        const macroTrend = macroChange > 0.002 ? 'bullish' : macroChange < -0.002 ? 'bearish' : 'neutral';
+        // Tendencia micro (1m) - últimas 10 velas
+        const micro1m = klines1m.slice(-10);
+        const microChange = (micro1m[micro1m.length - 1].close - micro1m[0].close) / micro1m[0].close;
+        const microTrend = microChange > 0.001 ? 'bullish' : microChange < -0.001 ? 'bearish' : 'neutral';
+        // Detectar divergencia (oportunidad de scalping)
+        const divergence = (macroTrend === 'bullish' && microTrend === 'bearish') ||
+            (macroTrend === 'bearish' && microTrend === 'bullish');
+        let suggestedAction = 'HOLD';
+        let confidence = 0.5;
+        if (divergence) {
+            if (macroTrend === 'bullish' && microTrend === 'bearish') {
+                suggestedAction = 'SHORT_QUICK'; // Corrección temporal en tendencia alcista
+                confidence = 0.7;
+            }
+            else if (macroTrend === 'bearish' && microTrend === 'bullish') {
+                suggestedAction = 'LONG_QUICK'; // Rebote temporal en tendencia bajista
+                confidence = 0.7;
+            }
+        }
+        else {
+            // Sin divergencia, seguir la tendencia
+            if (macroTrend === 'bullish' && microTrend === 'bullish') {
+                suggestedAction = 'LONG';
+                confidence = 0.8;
+            }
+            else if (macroTrend === 'bearish' && microTrend === 'bearish') {
+                suggestedAction = 'SHORT';
+                confidence = 0.8;
+            }
+        }
+        return {
+            microTrend,
+            macroTrend,
+            divergence,
+            suggestedAction,
+            confidence
+        };
+    }
 }
 exports.TechnicalAnalysis = TechnicalAnalysis;
 //# sourceMappingURL=technical-analysis.js.map

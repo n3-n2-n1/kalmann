@@ -98,6 +98,39 @@ class BybitClient {
         }
     }
     /**
+     * Obtiene el Order Book (libro de órdenes) para análisis de liquidez y presión compra/venta
+     */
+    async getOrderBook(symbol, depth = 50) {
+        try {
+            const response = await this.client.get('/v5/market/orderbook', {
+                params: {
+                    category: 'linear',
+                    symbol,
+                    limit: depth
+                }
+            });
+            if (!response.data.result) {
+                throw new Error('No hay datos de order book en la respuesta');
+            }
+            const data = response.data.result;
+            return {
+                bids: data.b.map((bid) => ({
+                    price: parseFloat(bid[0]),
+                    quantity: parseFloat(bid[1])
+                })),
+                asks: data.a.map((ask) => ({
+                    price: parseFloat(ask[0]),
+                    quantity: parseFloat(ask[1])
+                })),
+                timestamp: parseInt(data.ts)
+            };
+        }
+        catch (error) {
+            this.logger.error('Error obteniendo order book:', error);
+            throw new Error(`Error obteniendo order book para ${symbol}`);
+        }
+    }
+    /**
      * Ejecuta una orden de trading
      */
     async executeTrade(params) {
@@ -106,24 +139,39 @@ class BybitClient {
             if (params.leverage) {
                 await this.setLeverage(params.symbol, params.leverage);
             }
+            // IMPORTANTE: El orden de las propiedades debe seguir la documentación de Bybit
+            // Orden según docs: category, symbol, side, orderType, qty, timeInForce, stopLoss, takeProfit
+            // FIX: Limpiar precisión de punto flotante (0.407000000000003 -> 0.407)
+            const cleanQuantity = this.cleanFloatPrecision(params.quantity, 8);
             const orderData = {
                 category: 'linear',
                 symbol: params.symbol,
                 side: params.side,
                 orderType: 'Market',
-                qty: params.quantity.toString(),
+                qty: cleanQuantity,
                 timeInForce: 'IOC'
             };
-            const response = await this.makeAuthenticatedRequest('/v5/order/create', orderData);
+            // Agregar Stop Loss y Take Profit si se proporcionan
+            if (params.stopLoss) {
+                orderData.stopLoss = this.cleanFloatPrecision(params.stopLoss, 2);
+                orderData.slTriggerBy = 'LastPrice';
+            }
+            if (params.takeProfit) {
+                orderData.takeProfit = this.cleanFloatPrecision(params.takeProfit, 2);
+                orderData.tpTriggerBy = 'LastPrice';
+            }
+            this.logger.info(`Ejecutando orden: ${params.side} ${params.quantity} ${params.symbol}${params.stopLoss ? ` | SL: ${params.stopLoss}` : ''}${params.takeProfit ? ` | TP: ${params.takeProfit}` : ''}`);
+            const response = await this.makeAuthenticatedRequest('/v5/order/create', orderData, 'POST');
+            this.logger.info(`Orden ejecutada exitosamente: ${response.result.orderId}`);
             return {
                 orderId: response.result.orderId,
                 symbol: params.symbol,
                 side: params.side,
                 quantity: params.quantity,
-                price: parseFloat(response.result.avgPrice),
+                price: parseFloat(response.result.avgPrice || '0'),
                 status: 'filled',
                 timestamp: Date.now(),
-                fees: parseFloat(response.result.cumExecFee)
+                fees: parseFloat(response.result.cumExecFee || '0')
             };
         }
         catch (error) {
@@ -174,17 +222,20 @@ class BybitClient {
      */
     async setLeverage(symbol, leverage) {
         try {
-            await this.makeAuthenticatedRequest('/v5/position/set-leverage', {
+            // IMPORTANTE: El orden de las propiedades debe coincidir con la documentación de Bybit
+            const params = {
                 category: 'linear',
-                symbol,
+                symbol: symbol,
                 buyLeverage: leverage.toString(),
                 sellLeverage: leverage.toString()
-            });
+            };
+            await this.makeAuthenticatedRequest('/v5/position/set-leverage', params, 'POST');
             this.logger.info(`Leverage establecido a ${leverage}x para ${symbol}`);
         }
         catch (error) {
             this.logger.error('Error estableciendo leverage:', error);
-            throw new Error(`Error estableciendo leverage para ${symbol}`);
+            // No lanzar error crítico, solo advertir - el trade puede continuar con leverage por defecto
+            this.logger.warn(`Continuando sin cambiar leverage para ${symbol}`);
         }
     }
     /**
@@ -204,10 +255,28 @@ class BybitClient {
                 };
             }
             const account = response.result.list[0];
+            // Calcular balance total sumando todas las monedas en USD
+            let totalBalanceUSD = 0;
+            let usdtBalance = 0;
+            if (account.coin && Array.isArray(account.coin)) {
+                for (const coin of account.coin) {
+                    const usdValue = parseFloat(coin.usdValue) || 0;
+                    totalBalanceUSD += usdValue;
+                    // Guardar balance USDT específicamente
+                    if (coin.coin === 'USDT') {
+                        usdtBalance = parseFloat(coin.walletBalance) || 0;
+                    }
+                }
+            }
+            // Usar el balance total de la cuenta unificada si está disponible
+            const totalBalance = parseFloat(account.totalEquity) || totalBalanceUSD || 10000;
+            // Para disponible, usar USDT disponible o un porcentaje del total
+            const availableBalance = usdtBalance > 0 ? usdtBalance : totalBalance * 0.95;
+            this.logger.info(`Balance obtenido - Total: $${totalBalance.toFixed(2)}, Disponible: $${availableBalance.toFixed(2)}`);
             return {
-                totalBalance: parseFloat(account.totalWalletBalance),
-                availableBalance: parseFloat(account.totalAvailableBalance),
-                usedMargin: parseFloat(account.totalPerpUPL)
+                totalBalance,
+                availableBalance,
+                usedMargin: parseFloat(account.totalPerpUPL) || 0
             };
         }
         catch (error) {
@@ -221,20 +290,111 @@ class BybitClient {
         }
     }
     /**
-     * Cierra una posición específica
+     * Actualiza el Stop Loss de una posición existente (para trailing stop)
      */
-    async closePosition(symbol, side) {
+    async updatePositionStopLoss(symbol, stopLoss, takeProfit) {
+        try {
+            const params = {
+                category: 'linear',
+                symbol: symbol,
+                stopLoss: stopLoss.toString(),
+                slTriggerBy: 'LastPrice',
+                positionIdx: 0 // 0 = one-way mode
+            };
+            // Agregar take profit si se proporciona
+            if (takeProfit) {
+                params.takeProfit = takeProfit.toString();
+                params.tpTriggerBy = 'LastPrice';
+            }
+            await this.makeAuthenticatedRequest('/v5/position/trading-stop', params, 'POST');
+            this.logger.info(`Stop Loss actualizado para ${symbol}: SL=${stopLoss}${takeProfit ? `, TP=${takeProfit}` : ''}`);
+        }
+        catch (error) {
+            this.logger.error('Error actualizando stop loss:', error);
+            throw new Error(`Error actualizando SL para ${symbol}`);
+        }
+    }
+    /**
+     * Obtiene el historial de órdenes ejecutadas
+     */
+    async getOrderHistory(symbol, limit = 50) {
+        try {
+            const params = {
+                category: 'linear',
+                symbol,
+                orderStatus: 'Filled', // Solo órdenes ejecutadas
+                limit
+            };
+            const response = await this.makeAuthenticatedRequest('/v5/order/history', params, 'GET');
+            if (response.retCode !== 0) {
+                this.logger.warn(`Error obteniendo historial de órdenes: ${response.retMsg}`);
+                return [];
+            }
+            return response.result?.list || [];
+        }
+        catch (error) {
+            this.logger.error('Error obteniendo historial de órdenes:', error);
+            return [];
+        }
+    }
+    /**
+     * Verifica si hubo ejecuciones de TP/SL en las últimas órdenes
+     */
+    async checkTPSLExecutions(symbol, lastCheckTime) {
+        try {
+            const history = await this.getOrderHistory(symbol, 20);
+            const recentOrders = history.filter((order) => {
+                const orderTime = parseInt(order.updatedTime || order.createdTime);
+                return orderTime > lastCheckTime;
+            });
+            const tpExecuted = recentOrders.some((order) => order.stopOrderType === 'TakeProfit' ||
+                order.triggerBy === 'LastPrice' && parseFloat(order.triggerPrice) > 0);
+            const slExecuted = recentOrders.some((order) => order.stopOrderType === 'StopLoss' ||
+                (order.stopOrderType === 'Stop' && order.side !== order.positionIdx));
+            if (recentOrders.length > 0) {
+                this.logger.info(`📋 Órdenes recientes encontradas: ${recentOrders.length}`);
+                recentOrders.forEach((order) => {
+                    this.logger.debug(`  - ${order.side} ${order.qty} @ ${order.avgPrice} | Estado: ${order.orderStatus} | Tipo: ${order.stopOrderType || 'Market'}`);
+                });
+            }
+            return {
+                tpExecuted,
+                slExecuted,
+                orders: recentOrders
+            };
+        }
+        catch (error) {
+            this.logger.error('Error verificando ejecuciones TP/SL:', error);
+            return { tpExecuted: false, slExecuted: false, orders: [] };
+        }
+    }
+    /**
+     * Cierra una posición específica (completa o parcial)
+     */
+    async closePosition(symbol, side, percentage = 100) {
         try {
             const positions = await this.getPositions(symbol);
             const position = positions.find(p => p.symbol === symbol && p.side === side);
             if (!position) {
                 throw new Error(`No se encontró posición para cerrar: ${symbol} ${side}`);
             }
+            // Obtener info del símbolo para respetar stepSize
+            const symbolInfo = await this.getSymbolInfo(symbol);
             const closeSide = side === 'Buy' ? 'Sell' : 'Buy';
+            const quantityRaw = (position.size * percentage) / 100;
+            // Redondear según stepSize (CRÍTICO para ASTERUSDT y otros con stepSize = 1)
+            const stepSize = symbolInfo.stepSize || 0.001;
+            const quantityToClose = Math.floor(quantityRaw / stepSize) * stepSize;
+            // Validar que la cantidad no sea 0
+            if (quantityToClose <= 0) {
+                this.logger.warn(`Cantidad calculada es 0 después de redondear. Raw: ${quantityRaw}, StepSize: ${stepSize}`);
+                throw new Error(`Cantidad a cerrar es demasiado pequeña: ${quantityRaw}`);
+            }
+            this.logger.info(`Cerrando ${percentage}% de posición ${side} ${symbol}: ${quantityToClose} unidades (raw: ${quantityRaw.toFixed(4)}, stepSize: ${stepSize})`);
             return await this.executeTrade({
                 symbol,
                 side: closeSide,
-                quantity: position.size
+                quantity: quantityToClose
             });
         }
         catch (error) {
@@ -248,14 +408,38 @@ class BybitClient {
     async makeAuthenticatedRequest(endpoint, params = {}, method = 'GET') {
         const timestamp = Date.now().toString();
         const recvWindow = '5000';
-        // Crear query string para firma
-        const queryString = new URLSearchParams(params).toString();
-        // Crear firma según documentación de Bybit
+        // Para POST, usar JSON stringify; para GET, usar query string
+        let signaturePayload;
+        let sortedParams = params;
+        if (method === 'POST') {
+            // Para POST: NO ordenar, mantener el orden original del objeto
+            // Bybit espera el JSON sin espacios en blanco
+            signaturePayload = JSON.stringify(params);
+        }
+        else {
+            // Para GET: ordenar alfabéticamente y usar el mismo orden para firma y request
+            sortedParams = Object.keys(params)
+                .sort()
+                .reduce((acc, key) => {
+                acc[key] = params[key];
+                return acc;
+            }, {});
+            // Crear query string ordenado para la firma
+            const stringParams = Object.keys(sortedParams).reduce((acc, key) => {
+                acc[key] = String(sortedParams[key]);
+                return acc;
+            }, {});
+            signaturePayload = new URLSearchParams(stringParams).toString();
+        }
+        // Crear firma según documentación de Bybit V5
+        // Formato: timestamp + apiKey + recvWindow + signaturePayload
+        const preSignString = timestamp + this.config.apiKey + recvWindow + signaturePayload;
         const signature = crypto_1.default
             .createHmac('sha256', this.config.apiSecret)
-            .update(timestamp + this.config.apiKey + recvWindow + queryString)
+            .update(preSignString)
             .digest('hex');
-        this.logger.debug(`Autenticación: timestamp=${timestamp}, query=${queryString}, signature=${signature}`);
+        this.logger.debug(`Autenticación [${method}]: timestamp=${timestamp}`);
+        this.logger.debug(`Signature payload: ${signaturePayload}`);
         const headers = {
             'X-BAPI-API-KEY': this.config.apiKey,
             'X-BAPI-SIGN': signature,
@@ -267,14 +451,23 @@ class BybitClient {
         let response;
         try {
             if (method === 'GET') {
-                response = await this.client.get(endpoint, { params, headers });
+                // Usar los parámetros ordenados para el request también
+                response = await this.client.get(endpoint, { params: sortedParams, headers });
             }
             else {
                 response = await this.client.post(endpoint, params, { headers });
             }
             this.logger.debug(`Respuesta Bybit: ${JSON.stringify(response.data)}`);
-            if (response.data.retCode !== 0) {
+            // Error codes que podemos ignorar
+            const ignorableErrors = [
+                110043, // leverage not modified - el leverage ya está configurado correctamente
+            ];
+            if (response.data.retCode !== 0 && !ignorableErrors.includes(response.data.retCode)) {
                 throw new Error(`Error API Bybit: ${response.data.retMsg} (Code: ${response.data.retCode})`);
+            }
+            // Si es un error ignorable, solo loguear warning
+            if (response.data.retCode !== 0 && ignorableErrors.includes(response.data.retCode)) {
+                this.logger.warn(`Bybit warning (ignorado): ${response.data.retMsg} (Code: ${response.data.retCode})`);
             }
             return response.data;
         }
@@ -358,6 +551,22 @@ class BybitClient {
             '1d': 'D'
         };
         return intervals[interval] || '5';
+    }
+    /**
+     * Limpia errores de precisión de punto flotante
+     * Convierte 0.40700000000000003 -> "0.407"
+     */
+    cleanFloatPrecision(value, maxDecimals = 8) {
+        // Redondear a maxDecimals y eliminar ceros innecesarios
+        const rounded = Number(value.toFixed(maxDecimals));
+        // Si es un entero, devolver sin decimales
+        if (Number.isInteger(rounded)) {
+            return rounded.toString();
+        }
+        // Convertir a string y eliminar ceros trailing
+        let str = rounded.toFixed(maxDecimals);
+        str = str.replace(/\.?0+$/, ''); // Elimina .000 o 0.4070000 -> 0.407
+        return str;
     }
 }
 exports.BybitClient = BybitClient;

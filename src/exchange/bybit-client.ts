@@ -163,23 +163,27 @@ export class BybitClient {
 
       // IMPORTANTE: El orden de las propiedades debe seguir la documentación de Bybit
       // Orden según docs: category, symbol, side, orderType, qty, timeInForce, stopLoss, takeProfit
+      
+      // FIX: Limpiar precisión de punto flotante (0.407000000000003 -> 0.407)
+      const cleanQuantity = this.cleanFloatPrecision(params.quantity, 8);
+      
       const orderData: any = {
         category: 'linear',
         symbol: params.symbol,
         side: params.side,
         orderType: 'Market',
-        qty: params.quantity.toString(),
+        qty: cleanQuantity,
         timeInForce: 'IOC'
       };
 
       // Agregar Stop Loss y Take Profit si se proporcionan
       if (params.stopLoss) {
-        orderData.stopLoss = params.stopLoss.toString();
+        orderData.stopLoss = this.cleanFloatPrecision(params.stopLoss, 2);
         orderData.slTriggerBy = 'LastPrice';
       }
 
       if (params.takeProfit) {
-        orderData.takeProfit = params.takeProfit.toString();
+        orderData.takeProfit = this.cleanFloatPrecision(params.takeProfit, 2);
         orderData.tpTriggerBy = 'LastPrice';
       }
 
@@ -361,6 +365,76 @@ export class BybitClient {
   }
 
   /**
+   * Obtiene el historial de órdenes ejecutadas
+   */
+  async getOrderHistory(symbol: string, limit: number = 50): Promise<any[]> {
+    try {
+      const params = {
+        category: 'linear',
+        symbol,
+        orderStatus: 'Filled', // Solo órdenes ejecutadas
+        limit
+      };
+
+      const response = await this.makeAuthenticatedRequest('/v5/order/history', params, 'GET');
+      
+      if (response.retCode !== 0) {
+        this.logger.warn(`Error obteniendo historial de órdenes: ${response.retMsg}`);
+        return [];
+      }
+
+      return response.result?.list || [];
+    } catch (error) {
+      this.logger.error('Error obteniendo historial de órdenes:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Verifica si hubo ejecuciones de TP/SL en las últimas órdenes
+   */
+  async checkTPSLExecutions(symbol: string, lastCheckTime: number): Promise<{
+    tpExecuted: boolean;
+    slExecuted: boolean;
+    orders: any[];
+  }> {
+    try {
+      const history = await this.getOrderHistory(symbol, 20);
+      
+      const recentOrders = history.filter((order: any) => {
+        const orderTime = parseInt(order.updatedTime || order.createdTime);
+        return orderTime > lastCheckTime;
+      });
+
+      const tpExecuted = recentOrders.some((order: any) => 
+        order.stopOrderType === 'TakeProfit' || 
+        order.triggerBy === 'LastPrice' && parseFloat(order.triggerPrice) > 0
+      );
+
+      const slExecuted = recentOrders.some((order: any) => 
+        order.stopOrderType === 'StopLoss' ||
+        (order.stopOrderType === 'Stop' && order.side !== order.positionIdx)
+      );
+
+      if (recentOrders.length > 0) {
+        this.logger.info(`📋 Órdenes recientes encontradas: ${recentOrders.length}`);
+        recentOrders.forEach((order: any) => {
+          this.logger.debug(`  - ${order.side} ${order.qty} @ ${order.avgPrice} | Estado: ${order.orderStatus} | Tipo: ${order.stopOrderType || 'Market'}`);
+        });
+      }
+
+      return {
+        tpExecuted,
+        slExecuted,
+        orders: recentOrders
+      };
+    } catch (error) {
+      this.logger.error('Error verificando ejecuciones TP/SL:', error);
+      return { tpExecuted: false, slExecuted: false, orders: [] };
+    }
+  }
+
+  /**
    * Cierra una posición específica (completa o parcial)
    */
   async closePosition(symbol: string, side: 'Buy' | 'Sell', percentage: number = 100): Promise<TradeResult> {
@@ -410,19 +484,27 @@ export class BybitClient {
     
     // Para POST, usar JSON stringify; para GET, usar query string
     let signaturePayload: string;
+    let sortedParams: any = params;
+    
     if (method === 'POST') {
       // Para POST: NO ordenar, mantener el orden original del objeto
       // Bybit espera el JSON sin espacios en blanco
       signaturePayload = JSON.stringify(params);
     } else {
-      // Para GET: usar query string ordenado alfabéticamente
-      const sortedParams = Object.keys(params)
+      // Para GET: ordenar alfabéticamente y usar el mismo orden para firma y request
+      sortedParams = Object.keys(params)
         .sort()
         .reduce((acc, key) => {
           acc[key] = params[key];
           return acc;
         }, {} as any);
-      signaturePayload = new URLSearchParams(sortedParams).toString();
+      
+      // Crear query string ordenado para la firma
+      const stringParams = Object.keys(sortedParams).reduce((acc, key) => {
+        acc[key] = String(sortedParams[key]);
+        return acc;
+      }, {} as Record<string, string>);
+      signaturePayload = new URLSearchParams(stringParams).toString();
     }
     
     // Crear firma según documentación de Bybit V5
@@ -448,7 +530,8 @@ export class BybitClient {
     let response;
     try {
       if (method === 'GET') {
-        response = await this.client.get(endpoint, { params, headers });
+        // Usar los parámetros ordenados para el request también
+        response = await this.client.get(endpoint, { params: sortedParams, headers });
       } else {
         response = await this.client.post(endpoint, params, { headers });
       }
@@ -563,5 +646,25 @@ export class BybitClient {
       '1d': 'D'
     };
     return intervals[interval] || '5';
+  }
+
+  /**
+   * Limpia errores de precisión de punto flotante
+   * Convierte 0.40700000000000003 -> "0.407"
+   */
+  private cleanFloatPrecision(value: number, maxDecimals: number = 8): string {
+    // Redondear a maxDecimals y eliminar ceros innecesarios
+    const rounded = Number(value.toFixed(maxDecimals));
+    
+    // Si es un entero, devolver sin decimales
+    if (Number.isInteger(rounded)) {
+      return rounded.toString();
+    }
+    
+    // Convertir a string y eliminar ceros trailing
+    let str = rounded.toFixed(maxDecimals);
+    str = str.replace(/\.?0+$/, ''); // Elimina .000 o 0.4070000 -> 0.407
+    
+    return str;
   }
 }

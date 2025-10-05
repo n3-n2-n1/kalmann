@@ -8,6 +8,7 @@ const dotenv_1 = __importDefault(require("dotenv"));
 const server_1 = require("./mcp/server");
 const trading_strategy_1 = require("./strategy/trading-strategy");
 const logger_1 = require("./utils/logger");
+const metrics_1 = require("./utils/metrics");
 // Cargar variables de entorno
 dotenv_1.default.config();
 /**
@@ -20,6 +21,10 @@ class TradingSystem {
     isRunning = false;
     constructor() {
         this.logger = new logger_1.Logger('TradingSystem');
+        // Inicializar sistema de métricas Prometheus
+        const metricsPort = parseInt(process.env.PROMETHEUS_PORT || '9090');
+        (0, metrics_1.initializeMetrics)(metricsPort);
+        this.logger.info(`Sistema de métricas iniciado en puerto ${metricsPort}`);
         this.mcpServer = new server_1.MCPServer(parseInt(process.env.MCP_PORT || '3001'));
         this.tradingStrategy = new trading_strategy_1.TradingStrategy();
     }

@@ -19,7 +19,7 @@ class RiskManager {
         this.config = {
             symbol: process.env.TRADING_SYMBOL || 'BTCUSDT',
             maxLeverage: parseInt(process.env.MAX_LEVERAGE || '5'),
-            maxPositionSize: parseFloat(process.env.MAX_POSITION_SIZE || '1000'),
+            maxPositionSize: parseFloat(process.env.MAX_POSITION_SIZE || '1000000'),
             riskPercentage: parseFloat(process.env.RISK_PERCENTAGE || '2'),
             stopLossPercentage: parseFloat(process.env.STOP_LOSS_PERCENTAGE || '3'),
             takeProfitPercentage: parseFloat(process.env.TAKE_PROFIT_PERCENTAGE || '6'),
@@ -45,12 +45,23 @@ class RiskManager {
             }
             // Obtener balance actual
             const balance = await this.bybit.getBalance();
-            // Calcular tamaño de posición máximo - PERMITIR TRADES MÁS GRANDES
-            const requestedPositionValue = tradeParams.quantity * (await this.getCurrentPrice(tradeParams.symbol));
-            // Permitir trades hasta 50% del balance para demo trading
-            const maxAllowedValue = balance.totalBalance * 0.5;
+            // Calcular tamaño de posición máximo - AJUSTADO PARA SCALPING (más permisivo)
+            const currentPrice = await this.getCurrentPrice(tradeParams.symbol);
+            const requestedPositionValue = tradeParams.quantity * currentPrice;
+            this.logger.info(`Validando posición: Cantidad=${tradeParams.quantity}, Precio=${currentPrice.toFixed(2)}, Valor=$${requestedPositionValue.toFixed(2)}`);
+            // Verificar si la cantidad es válida
+            if (!tradeParams.quantity || isNaN(tradeParams.quantity) || tradeParams.quantity <= 0) {
+                return {
+                    approved: false,
+                    reason: `Cantidad de trade inválida: ${tradeParams.quantity}`,
+                    riskScore: 1.0
+                };
+            }
+            // Para scalping: Permitir trades más pequeños (hasta 30% del balance total)
+            const maxAllowedValue = balance.totalBalance * 0.3;
             if (requestedPositionValue > maxAllowedValue) {
-                const adjustedQuantity = Math.floor(maxAllowedValue / (await this.getCurrentPrice(tradeParams.symbol)));
+                const adjustedQuantity = Math.floor((maxAllowedValue / currentPrice) * 1000) / 1000; // Redondear a 3 decimales
+                this.logger.warn(`Posición excede límite. Solicitado: $${requestedPositionValue.toFixed(2)}, Máximo: $${maxAllowedValue.toFixed(2)}`);
                 return {
                     approved: false,
                     reason: `Posición excede límite de riesgo. Máximo: $${maxAllowedValue.toFixed(2)}`,
@@ -140,10 +151,12 @@ class RiskManager {
         }
         const currentPrice = await this.getCurrentPrice(tradeParams.symbol);
         const stopLossDistance = Math.abs(currentPrice - tradeParams.stopLoss) / currentPrice;
-        if (stopLossDistance > this.config.stopLossPercentage / 100) {
+        // Permitir un margen del 5% sobre el límite configurado
+        const maxAllowedDistance = (this.config.stopLossPercentage * 1.05) / 100;
+        if (stopLossDistance > maxAllowedDistance) {
             return {
                 valid: false,
-                reason: `Stop loss demasiado lejos: ${(stopLossDistance * 100).toFixed(2)}% (máx: ${this.config.stopLossPercentage}%)`
+                reason: `Stop loss demasiado lejos: ${(stopLossDistance * 100).toFixed(2)}% (máx permitido: ${(maxAllowedDistance * 100).toFixed(2)}%)`
             };
         }
         return { valid: true, reason: 'Stop loss válido' };

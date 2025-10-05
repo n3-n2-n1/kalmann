@@ -4,11 +4,13 @@ import { Logger } from "../utils/logger";
 
 /**
  * Cliente para interactuar con Ollama y obtener análisis de IA
+ * Soporta análisis directo y function calling (si el modelo lo soporta)
  */
 export class OllamaClient {
   private client: AxiosInstance;
   private logger: Logger;
   private config: OllamaConfig;
+  private supportsTools: boolean = false;
 
   constructor() {
     this.logger = new Logger("OllamaClient");
@@ -29,29 +31,71 @@ export class OllamaClient {
     this.logger.info(
       `Cliente Ollama inicializado: ${this.config.host} - ${this.config.model} (timeout: ${this.config.timeout}ms)`
     );
+    
+    // Detectar si el modelo soporta function calling
+    this.detectToolsSupport();
+  }
+
+  /**
+   * Detecta si Ollama/modelo soporta function calling
+   */
+  private async detectToolsSupport(): Promise<void> {
+    try {
+      // Modelos que típicamente soportan function calling
+      const toolsSupportedModels = [
+        'llama3.1', 'llama3.2', 'mixtral', 'qwen', 'command-r',
+        'llama3', 'mistral', 'gemma2', 'deepseek'
+      ];
+      
+      const modelName = this.config.model.toLowerCase();
+      this.supportsTools = toolsSupportedModels.some(m => modelName.includes(m));
+      
+      // DeepSeek-R1 es un modelo de razonamiento especial
+      if (modelName.includes('deepseek-r1')) {
+        this.logger.info(`🧠 Modelo ${this.config.model} detectado: RAZONAMIENTO PROFUNDO activado`);
+        this.logger.info(`   DeepSeek-R1 analiza paso a paso - perfecto para trading`);
+      } else if (this.supportsTools) {
+        this.logger.info(`✅ Modelo ${this.config.model} soporta function calling`);
+      } else {
+        this.logger.info(`ℹ️  Modelo ${this.config.model} usa análisis directo (sin function calling)`);
+      }
+    } catch (error) {
+      this.logger.warn('No se pudo detectar soporte de tools, usando modo estándar');
+      this.supportsTools = false;
+    }
   }
 
   /**
    * Analiza datos de mercado y devuelve decisión de trading
+   * Usa el prompt optimizado que ya incluye TODOS los datos necesarios
    */
   async analyze(prompt: string): Promise<AIAnalysis> {
     try {
       this.logger.debug("Enviando prompt a Ollama para análisis");
       
+      // Configuración optimizada según el modelo
+      const isDeepSeek = this.config.model.toLowerCase().includes('deepseek');
+      
       const response = await this.client.post("/api/generate", {
         model: this.config.model,
         prompt: prompt,
         stream: false,
+        format: 'json', // Forzar respuesta JSON
         options: {
-          temperature: 0.35, // Menor temperatura para decisiones más consistentes
+          temperature: isDeepSeek ? 0.2 : 0.35, // DeepSeek funciona mejor con temp baja
           top_p: 0.9,
-          top_k: 40,
-          num_predict: 500,
+          top_k: isDeepSeek ? 20 : 40, // DeepSeek más conservador
+          num_predict: isDeepSeek ? 800 : 500, // DeepSeek genera razonamiento más largo
         },
       });
 
       const aiResponse = response.data.response;
-      this.logger.debug("Respuesta recibida de Ollama");
+      
+      if (isDeepSeek) {
+        this.logger.debug("Respuesta recibida de DeepSeek-R1 (con razonamiento)");
+      } else {
+        this.logger.debug("Respuesta recibida de Ollama");
+      }
 
       // Parsear la respuesta JSON del modelo
       const analysis = this.parseAIResponse(aiResponse);
@@ -71,6 +115,33 @@ export class OllamaClient {
         marketSentiment: "neutral",
         riskLevel: "high",
         suggestedLeverage: 1,
+      };
+    }
+  }
+
+  /**
+   * Obtiene información del modelo actual
+   */
+  async getModelInfo(): Promise<{
+    name: string;
+    size: string;
+    supportsTools: boolean;
+  }> {
+    try {
+      const response = await this.client.get("/api/tags");
+      const models = response.data.models || [];
+      const currentModel = models.find((m: any) => m.name === this.config.model);
+      
+      return {
+        name: this.config.model,
+        size: currentModel?.size || 'unknown',
+        supportsTools: this.supportsTools
+      };
+    } catch (error) {
+      return {
+        name: this.config.model,
+        size: 'unknown',
+        supportsTools: false
       };
     }
   }
@@ -505,8 +576,40 @@ ${reversal_signals.length > 0 ? `⚠️  HAY ${reversal_signals.length} SEÑAL(E
         : "medium",
       suggestedLeverage: Math.max(
         1,
-        Math.min(10, analysis.suggestedLeverage || 2)
+        Math.min(50, analysis.suggestedLeverage || 5) // Aumentado a 50 como en tu config
       ),
     };
   }
-}
+
+  /**
+   * Reinicia el cliente (útil para reconexión)
+   */
+  async reconnect(): Promise<void> {
+    this.logger.info('Reconectando cliente Ollama...');
+    this.client = axios.create({
+      baseURL: this.config.host,
+      timeout: this.config.timeout,
+      headers: {
+        "Content-Type": "application/json",
+      },
+    });
+    await this.detectToolsSupport();
+  }
+
+  /**
+   * Obtiene estadísticas de uso
+   */
+  getStats(): {
+    host: string;
+    model: string;
+    timeout: number;
+    supportsTools: boolean;
+  } {
+    return {
+      host: this.config.host,
+      model: this.config.model,
+      timeout: this.config.timeout,
+      supportsTools: this.supportsTools
+    };
+  }
+} 

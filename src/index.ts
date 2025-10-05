@@ -2,6 +2,7 @@ import dotenv from 'dotenv';
 import { MCPServer } from './mcp/server';
 import { TradingStrategy } from './strategy/trading-strategy';
 import { Logger } from './utils/logger';
+import { initializeMetrics } from './utils/metrics';
 
 // Cargar variables de entorno
 dotenv.config();
@@ -17,6 +18,12 @@ class TradingSystem {
 
   constructor() {
     this.logger = new Logger('TradingSystem');
+    
+    // Inicializar sistema de métricas Prometheus
+    const metricsPort = parseInt(process.env.PROMETHEUS_PORT || '9090');
+    initializeMetrics(metricsPort);
+    this.logger.info(`Sistema de métricas iniciado en puerto ${metricsPort}`);
+    
     this.mcpServer = new MCPServer(parseInt(process.env.MCP_PORT || '3001'));
     this.tradingStrategy = new TradingStrategy();
   }
