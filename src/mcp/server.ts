@@ -213,6 +213,154 @@ export class MCPServer {
       }
     });
 
+    // Herramienta para cerrar posiciones (completa o parcialmente)
+    this.registerTool({
+      name: 'close_position',
+      description: 'Cierra una posición existente (completa o parcialmente). Usa esto cuando detectes señales de salida o reversión.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          symbol: { type: 'string' },
+          side: { type: 'string', enum: ['Buy', 'Sell'], description: 'El lado de la posición a cerrar' },
+          percentage: { type: 'number', default: 100, description: 'Porcentaje a cerrar: 25, 50 o 100' },
+          reason: { type: 'string', description: 'Razón para cerrar la posición' }
+        },
+        required: ['symbol', 'side']
+      },
+      handler: async (params) => {
+        const percentage = params.percentage || 100;
+        this.logger.info(`MCP Tool: Cerrando ${percentage}% de posición ${params.side} ${params.symbol}. Razón: ${params.reason || 'No especificada'}`);
+        return await this.bybit.closePosition(params.symbol, params.side, percentage);
+      }
+    });
+
+    // ========== NUEVAS TOOLS PARA SCALPING Y MULTI-TIMEFRAME ==========
+
+    // Tool 1: Obtener datos de mercado en timeframe 1m (para detectar micro-ciclos)
+    this.registerTool({
+      name: 'get_market_data_1m',
+      description: 'Obtiene datos de mercado en timeframe de 1 minuto para detectar micro-ciclos y oportunidades de scalping. Úsalo para ver movimientos recientes de corto plazo.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          symbol: { type: 'string' },
+          limit: { type: 'number', default: 20, description: 'Número de velas a obtener (default: 20)' }
+        },
+        required: ['symbol']
+      },
+      handler: async (params) => {
+        const klines1m = await this.bybit.getKlines(params.symbol, '1m', params.limit || 20);
+        const latest = klines1m[klines1m.length - 1];
+        
+        return {
+          timeframe: '1m',
+          candles_count: klines1m.length,
+          latest_price: latest.close,
+          latest_volume: latest.volume,
+          price_change_last_5m: ((latest.close - klines1m[Math.max(0, klines1m.length - 6)].close) / klines1m[Math.max(0, klines1m.length - 6)].close * 100).toFixed(3) + '%',
+          klines: klines1m.slice(-10) // Últimas 10 velas
+        };
+      }
+    });
+
+    // Tool 2: Detectar patrones de velas (3 rojas, 3 verdes, doji, etc)
+    this.registerTool({
+      name: 'analyze_candle_pattern',
+      description: 'Detecta patrones de velas en 1 minuto como 3 rojas consecutivas, 3 verdes, volume spikes, doji, etc. Perfecto para identificar reversiones rápidas en scalping.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          symbol: { type: 'string' },
+          lookback: { type: 'number', default: 20, description: 'Número de velas a analizar (default: 20)' }
+        },
+        required: ['symbol']
+      },
+      handler: async (params) => {
+        const klines1m = await this.bybit.getKlines(params.symbol, '1m', params.lookback || 20);
+        const patterns = this.technical.detectCandlePatterns(klines1m);
+        
+        return {
+          symbol: params.symbol,
+          timeframe: '1m',
+          patterns_found: patterns.patterns,
+          last_candles: patterns.lastCandles,
+          summary: patterns.patterns.length > 0 
+            ? `${patterns.patterns.length} patrón(es) detectado(s): ${patterns.patterns.map(p => p.type).join(', ')}`
+            : 'No se detectaron patrones significativos'
+        };
+      }
+    });
+
+    // Tool 3: Comparar tendencia 1m vs 5m (detectar divergencias = oportunidades)
+    this.registerTool({
+      name: 'detect_micro_trend',
+      description: 'Compara la tendencia de 1 minuto vs 5 minutos para detectar divergencias. Una divergencia (ej: tendencia alcista en 5m pero bajista en 1m) es una oportunidad perfecta para scalping.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          symbol: { type: 'string' }
+        },
+        required: ['symbol']
+      },
+      handler: async (params) => {
+        const klines1m = await this.bybit.getKlines(params.symbol, '1m', 20);
+        const klines5m = await this.bybit.getKlines(params.symbol, '5m', 40);
+        
+        const analysis = this.technical.compareTrends(klines1m, klines5m);
+        
+        return {
+          symbol: params.symbol,
+          micro_trend_1m: analysis.microTrend,
+          macro_trend_5m: analysis.macroTrend,
+          divergence_detected: analysis.divergence,
+          suggested_action: analysis.suggestedAction,
+          confidence: analysis.confidence,
+          interpretation: analysis.divergence 
+            ? `🎯 OPORTUNIDAD: Divergencia detectada! Tendencia general ${analysis.macroTrend} pero micro ${analysis.microTrend}. Sugerencia: ${analysis.suggestedAction}`
+            : `Tendencias alineadas: ${analysis.macroTrend}. Sin divergencia.`
+        };
+      }
+    });
+
+    // Tool 4: Analizar Order Book (presión compra/venta, walls, liquidez)
+    this.registerTool({
+      name: 'analyze_order_book',
+      description: 'Analiza el libro de órdenes (order book) para detectar presión de compra/venta, "walls" (grandes órdenes), spread y liquidez. Esto muestra la INTENCIÓN REAL del mercado en tiempo real.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          symbol: { type: 'string' },
+          depth: { type: 'number', default: 50, description: 'Profundidad del order book (default: 50)' }
+        },
+        required: ['symbol']
+      },
+      handler: async (params) => {
+        const orderBook = await this.bybit.getOrderBook(params.symbol, params.depth || 50);
+        const analysis = this.technical.analyzeOrderBook(orderBook);
+        
+        return {
+          symbol: params.symbol,
+          timestamp: orderBook.timestamp,
+          best_bid: orderBook.bids[0]?.price,
+          best_ask: orderBook.asks[0]?.price,
+          spread: analysis.spread.toFixed(2),
+          spread_percent: analysis.spreadPercent.toFixed(4) + '%',
+          bid_ask_imbalance: analysis.bidAskImbalance.toFixed(2),
+          total_bid_liquidity: analysis.totalBidLiquidity.toFixed(4),
+          total_ask_liquidity: analysis.totalAskLiquidity.toFixed(4),
+          market_pressure: analysis.pressure,
+          confidence: analysis.confidence,
+          bid_walls: analysis.bidWalls,
+          ask_walls: analysis.askWalls,
+          interpretation: analysis.pressure === 'BULLISH' 
+            ? `📈 Presión ALCISTA (${(analysis.bidAskImbalance * 100).toFixed(0)}% más compradores que vendedores)`
+            : analysis.pressure === 'BEARISH'
+            ? `📉 Presión BAJISTA (${(analysis.bidAskImbalance * 100).toFixed(0)}% más vendedores que compradores)`
+            : '➡️  Presión NEUTRAL - mercado equilibrado'
+        };
+      }
+    });
+
     this.logger.info(`${this.tools.size} herramientas MCP registradas`);
   }
 

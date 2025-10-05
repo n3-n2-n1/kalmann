@@ -145,7 +145,10 @@ class BybitClient {
                 this.logger.info('No hay posiciones activas');
                 return [];
             }
-            return response.result.list.map((pos) => ({
+            // Filtrar solo posiciones con size > 0 (posiciones realmente abiertas)
+            const positions = response.result.list
+                .filter((pos) => parseFloat(pos.size) > 0)
+                .map((pos) => ({
                 symbol: pos.symbol,
                 side: pos.side,
                 size: parseFloat(pos.size),
@@ -156,6 +159,8 @@ class BybitClient {
                 leverage: parseFloat(pos.leverage),
                 timestamp: Date.now()
             }));
+            this.logger.info(`Posiciones activas encontradas: ${positions.length}`);
+            return positions;
         }
         catch (error) {
             this.logger.error('Error obteniendo posiciones:', error);

@@ -80,7 +80,11 @@ class TradingStrategy {
                 const signal = await this.generateTradingSignal(symbol, analysis);
                 // Ejecutar acción si es necesaria
                 if (signal) {
+                    this.logger.info(`EJECUTANDO TRADE: ${signal.action} ${signal.quantity} ${signal.symbol}`);
                     await this.executeTradingAction(signal);
+                }
+                else {
+                    this.logger.info('No se generó señal de trading, esperando siguiente ciclo');
                 }
                 // Esperar antes del siguiente ciclo
                 await this.sleep(this.getIntervalMs(interval));
@@ -120,16 +124,21 @@ class TradingStrategy {
         const { technical, kalman, ai, marketData } = analysis;
         // Verificar si ya tenemos una posición abierta
         const existingPosition = await this.bybit.getPositions(symbol);
+        this.logger.info(`Posiciones existentes: ${existingPosition.length}`);
         if (existingPosition.length > 0) {
+            this.logger.info('Analizando posición existente...');
             return this.analyzeExistingPosition(existingPosition[0], analysis);
         }
         // Generar nueva señal solo si no hay posición
         if (ai.decision === 'HOLD') {
+            this.logger.info('AI sugiere HOLD, no se ejecutará trade');
             return null;
         }
+        this.logger.info(`AI sugiere ${ai.decision} con confianza ${ai.confidence}`);
         // Calcular parámetros de trading
         const leverage = this.calculateOptimalLeverage(ai, technical, kalman);
         const quantity = await this.calculatePositionSize(symbol, marketData.price, leverage);
+        this.logger.info(`Parámetros calculados - Leverage: ${leverage}x, Quantity: ${quantity}`);
         if (quantity <= 0) {
             this.logger.warn('Cantidad calculada es 0 o negativa, saltando trade');
             return null;
@@ -137,6 +146,7 @@ class TradingStrategy {
         // Calcular stop loss y take profit
         const stopLoss = this.calculateStopLoss(marketData.price, ai.decision, technical);
         const takeProfit = this.calculateTakeProfit(marketData.price, stopLoss, ai.confidence);
+        this.logger.info(`Generando señal de trading: ${ai.decision} ${quantity} ${symbol} @ ${marketData.price} (SL: ${stopLoss}, TP: ${takeProfit})`);
         return {
             symbol,
             action: ai.decision,
@@ -192,7 +202,10 @@ class TradingStrategy {
      */
     async executeTradingAction(signal) {
         try {
+            this.logger.info('=== INICIO EJECUCIÓN DE TRADE ===');
+            this.logger.info(`Señal: ${JSON.stringify(signal)}`);
             // Validar con risk manager
+            this.logger.info('Validando con Risk Manager...');
             const riskValidation = await this.riskManager.validateTrade({
                 symbol: signal.symbol,
                 side: signal.action === 'BUY' ? 'Buy' : 'Sell',
@@ -201,10 +214,12 @@ class TradingStrategy {
                 stopLoss: signal.stopLoss,
                 takeProfit: signal.takeProfit
             });
+            this.logger.info(`Resultado validación: ${JSON.stringify(riskValidation)}`);
             if (!riskValidation.approved) {
                 this.logger.warn(`Trade rechazado por gestión de riesgo: ${riskValidation.reason}`);
                 return;
             }
+            this.logger.info('Trade aprobado por Risk Manager, ejecutando...');
             if (signal.action === 'CLOSE') {
                 await this.bybit.closePosition(signal.symbol, signal.quantity > 0 ? 'Buy' : 'Sell');
                 this.logger.trade('CLOSE', {

@@ -173,3 +173,52 @@ export interface LogEntry {
   module: string;
   data?: any;
 }
+
+// === TIPOS PARA TRAILING STOP Y GESTIÓN DE POSICIONES ===
+export interface PositionTracking {
+  symbol: string;
+  side: 'Buy' | 'Sell';
+  entryPrice: number;
+  entryTime: number;
+  maxPriceReached: number;  // Para trailing stop de LONG
+  minPriceReached: number;  // Para trailing stop de SHORT
+  trailingStopActive: boolean;
+  currentStopLoss: number;
+  currentTakeProfit: number;
+  lastUpdateTime: number;
+  profitLadderExecuted: number[];  // Niveles ya ejecutados [25%, 50%, etc]
+}
+
+export interface ExitStrategy {
+  name: string;
+  triggered: boolean;
+  score: number;
+  reason: string;
+  action: 'CLOSE_100' | 'CLOSE_50' | 'CLOSE_25' | 'UPDATE_SL' | 'HOLD';
+}
+
+export interface PositionAnalysis {
+  position: Position;
+  timeInPosition: number;  // Horas
+  unrealizedPnL: number;
+  unrealizedPnLPercentage: number;
+  analysis: {
+    ai: AIAnalysis;
+    technical: TechnicalIndicators;
+    kalman: KalmanPrediction;
+  };
+  trailingStop: {
+    active: boolean;
+    maxPriceReached: number;
+    currentSL: number;
+    shouldUpdate: boolean;
+    newSL?: number;
+  };
+  exitStrategies: ExitStrategy[];
+  recommendation: {
+    action: 'HOLD' | 'CLOSE_FULL' | 'CLOSE_PARTIAL' | 'UPDATE_TRAILING';
+    percentage?: number;
+    reasons: string[];
+    confidence: number;
+  };
+}
